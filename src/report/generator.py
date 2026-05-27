@@ -50,13 +50,14 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.report.schema import PaperReport, ReportMeta, ReportSummary, REPORT_SCHEMA_DESCRIPTION
+from src.core.llm_response import strip_reasoning_artifacts
 
 
 # ============================================================
 # 报告生成 Prompt
 # ============================================================
 
-REPORT_PROMPT = """你是一名通信感知（ISAC/6G）领域的学术论文分析专家。
+REPORT_PROMPT = """你是一名大模型 Agent 领域的学术论文分析专家，熟悉 Agent 架构、规划、记忆、工具调用、多 Agent 协作、RAG 和评测 benchmark。
 
 请仔细阅读下方的论文文本，生成一份结构化的研究报告。
 
@@ -64,10 +65,10 @@ REPORT_PROMPT = """你是一名通信感知（ISAC/6G）领域的学术论文分
 1. **一句话概括**: 用一句中文精准概括论文核心贡献
 2. **问题定义**: 提炼论文要解决的核心问题
 3. **贡献列表**: 列出 3-5 条核心贡献，每条简洁有力
-4. **方法论**: 描述技术路线（信号模型、算法、架构等）
+4. **方法论**: 描述技术路线（Agent 架构、算法流程、记忆/检索机制、工具调用、评测设置等）
 5. **核心结果**: 总结关键实验结论（包含性能数据）
 6. **优缺点**: 客观评价论文的创新性和局限性
-7. **与我的关联**: 分析本文与通信感知/ISAC/6G 研究方向的关联
+7. **与我的关联**: 分析本文与大模型 Agent 研究方向的关联，尤其是规划、记忆、工具使用、多 Agent 协作、评测或工程落地方面的启发
 
 ## 论文信息
 - **标题**: {paper_title}
@@ -96,9 +97,11 @@ class ReportGenerator:
     def __init__(
         self,
         model: str | None = None,
-        max_tokens: int = 4000,
+        max_tokens: int = 16000,
     ):
-        self.model = model or os.getenv("MINIMAX_MODEL", "MiniMax-Text-01")
+        # max_tokens=16000: reasoning 模型 (MiniMax-M2 等) 的 <think> 块本身可能消耗
+        # 数千 token，必须留足空间给后续 JSON 输出
+        self.model = model or os.getenv("MINIMAX_MODEL", "MiniMax-M2")
         self.max_tokens = max_tokens
         self._client = None
 
@@ -168,7 +171,9 @@ class ReportGenerator:
                     },
                 },
             )
-            raw = response.choices[0].message.content
+            from src.core.llm_logging import log_model_once
+            log_model_once("report.generator", self.model, response)
+            raw = strip_reasoning_artifacts(response.choices[0].message.content or "")
         except Exception as e:
             logger.error(f"LLM 调用失败: {e}")
             # 生成一个占位报告

@@ -72,6 +72,11 @@ class PaperRecord:
     source_url: str = ""
     tags: list[str] = field(default_factory=list)
     venue: str = ""
+    first_seen_date: str = ""
+    """用户首次看到这篇论文的日期（YYYY-MM-DD）。
+    与 year（论文发表年份）和 download_date（本地下载日期）独立。
+    可以反映"论文 2017 年发表，但我 1 月才读到"这种语义。
+    add_paper_to_graph 默认会用这个字段来设置 first_seen_year_override。"""
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -91,6 +96,7 @@ class PaperRecord:
             source_url=data.get("source_url", ""),
             tags=data.get("tags", []),
             venue=data.get("venue", ""),
+            first_seen_date=data.get("first_seen_date", ""),
         )
 
 
@@ -251,29 +257,45 @@ class PaperRegistry:
                     logger.info(f"去重命中 [文件哈希]: {file_hash} → {p.title}")
                     return p
 
-        # Level 4: 标题模糊匹配
+        # Level 4: 标题模糊匹配（Phase 4 / 工程隐患 #9）
+        # 旧实现用 "shorter in longer" 子串 + 80% 长度比，会把
+        # "Attention Is All You Need" 与
+        # "Attention Is All You Need For Sign Language" 误判为同一篇。
+        # 新实现：token Jaccard ≥ 0.85，并要求长度比 ≥ 0.7。
         if title:
             norm_query = _normalize_title(title)
             if len(norm_query) < 5:
-                return None  # 标题太短，不做模糊匹配
+                return None
+            q_tokens = set(norm_query.split())
+            if len(q_tokens) < 3:
+                # 标题词数太少，token Jaccard 不可靠；只看精确匹配
+                for p in self._papers:
+                    if _normalize_title(p.title) == norm_query:
+                        logger.info(f"去重命中 [标题精确]: {title} → {p.title}")
+                        return p
+                return None
+
             for p in self._papers:
                 norm_existing = _normalize_title(p.title)
-                # 完全匹配或包含关系
+                # 精确匹配
                 if norm_query == norm_existing:
                     logger.info(f"去重命中 [标题精确]: {title} → {p.title}")
                     return p
-                # 子串包含（一个标题包含另一个的 80% 以上）
-                # 注意：长度相同时 min/max 会让 shorter==longer，导致 `in` 永真
-                if (
-                    len(norm_query) > 10
-                    and len(norm_existing) > 10
-                    and len(norm_query) != len(norm_existing)
-                ):
-                    shorter = min(norm_query, norm_existing, key=len)
-                    longer = max(norm_query, norm_existing, key=len)
-                    if shorter in longer and len(shorter) / len(longer) > 0.7:
-                        logger.info(f"去重命中 [标题模糊]: {title} → {p.title}")
-                        return p
+                e_tokens = set(norm_existing.split())
+                if not e_tokens:
+                    continue
+                # Token Jaccard
+                inter = q_tokens & e_tokens
+                union = q_tokens | e_tokens
+                jaccard = len(inter) / len(union)
+                # 长度比（避免短查询命中长存档）
+                len_ratio = min(len(norm_query), len(norm_existing)) / max(len(norm_query), len(norm_existing))
+                if jaccard >= 0.85 and len_ratio >= 0.7:
+                    logger.info(
+                        "去重命中 [标题模糊]: jaccard=%.2f len_ratio=%.2f %r → %r",
+                        jaccard, len_ratio, title, p.title,
+                    )
+                    return p
 
         return None
 

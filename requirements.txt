@@ -14,6 +14,21 @@ chromadb>=0.5.0
 # Knowledge Graph
 networkx>=3.2
 
+# Semantic embedding (Phase 2.4 SemanticIndex)
+# - Pin transformers<4.50 because >=4.50 uses Python 3.10+ generic subscription syntax
+#   that breaks on Python 3.9.
+# - Pin sentence-transformers<3 for same reason.
+# - If running Python 3.10+, can upgrade both freely.
+transformers<4.50
+sentence-transformers<3.0
+
+# Schema 验证 + 兼容 Python 3.9 的 PEP 604 union 注解
+pydantic>=2.0
+eval_type_backport>=0.2  # Python <3.10 needs this for Pydantic + `str | None` syntax
+
+# YAML 配置加载（aliases.yaml）
+pyyaml>=6.0
+
 # HTTP Client
 httpx>=0.27.0
 

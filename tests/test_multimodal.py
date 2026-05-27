@@ -15,8 +15,8 @@ Usage:
 
 import pytest
 
-# Guard: multimodal.py depends on anthropic SDK
-anthropic = pytest.importorskip("anthropic", reason="anthropic SDK not installed")
+# Guard: multimodal.py depends on openai SDK (OpenAI 兼容的 MiniMax 调用)
+openai = pytest.importorskip("openai", reason="openai SDK not installed")
 
 from src.core.multimodal import (
     FigureType,
@@ -47,18 +47,18 @@ class TestFigureAnalysisResult:
     def test_to_markdown(self):
         result = FigureAnalysisResult(
             figure_type=FigureType.BLOCK_DIAGRAM,
-            description="OFDM transceiver block diagram",
-            key_findings=["Uses 64-QAM modulation", "CP length is 16"],
+            description="ReAct agent workflow diagram",
+            key_findings=["Planner calls tools", "Reflection updates memory"],
             entities=[
-                {"name": "OFDM Modulator", "type": "module"},
-                {"name": "Channel Estimator", "type": "module"},
+                {"name": "Planner", "type": "module"},
+                {"name": "Memory Store", "type": "module"},
             ],
         )
         md = result.to_markdown()
         assert "block_diagram" in md
-        assert "OFDM transceiver" in md
-        assert "64-QAM" in md
-        assert "Channel Estimator" in md
+        assert "ReAct agent" in md
+        assert "Planner calls tools" in md
+        assert "Memory Store" in md
 
     def test_empty_result(self):
         result = FigureAnalysisResult(
@@ -116,7 +116,7 @@ Abstract
 This paper presents a novel approach...
 
 1. Introduction
-In recent years, ISAC has gained attention...
+In recent years, LLM Agents with tool use and memory have gained attention...
 
 3. Proposed Method
 We propose a deep learning based...
@@ -154,7 +154,7 @@ References
         assert "method" in summary
 
     def test_roman_numeral_sections(self):
-        """通信领域论文常用数字编号"""
+        """Agent 领域论文常用数字编号"""
         text = """
 Abstract
 Test abstract.
@@ -178,3 +178,108 @@ Conclusion content.
         # Should identify at least abstract and conclusion
         assert "abstract" in sections
         assert "conclusion" in sections
+
+
+
+# ============================================================
+# Phase 3 新功能测试
+# ============================================================
+
+
+class TestPhase3ChineseAndMarkdownSections:
+    """Phase 3.4: 章节正则扩展（中文 + markdown）"""
+
+    def setup_method(self):
+        from src.core.multimodal import PaperStructureParser
+        self.parser = PaperStructureParser()
+
+    def test_chinese_sections(self):
+        text = "\n".join([
+            "摘要", "ABS",
+            "引言", "INT",
+            "相关工作", "RW",
+            "方法", "MET",
+            "实验", "EXP",
+            "结论", "CONC",
+            "参考文献", "REF",
+        ])
+        sections = self.parser.parse_sections(text)
+        for k in ("abstract", "introduction", "related_work",
+                  "method", "experiments", "conclusion", "references"):
+            assert k in sections, f"missing {k}"
+
+    def test_chinese_with_numeric_prefix(self):
+        text = "\n".join([
+            "1. 引言", "A",
+            "2. 相关工作", "B",
+            "3. 方法", "C",
+            "4. 实验", "D",
+            "5. 结论", "E",
+        ])
+        sections = self.parser.parse_sections(text)
+        for k in ("introduction", "related_work", "method", "experiments", "conclusion"):
+            assert k in sections, f"missing {k}"
+
+    def test_neurips_markdown(self):
+        text = "\n".join([
+            "## Abstract", "ABS",
+            "## 1 Introduction", "INT",
+            "## 3 Methodology", "MET",
+            "## 4 Experiments", "EXP",
+            "## 5 Conclusion", "CONC",
+        ])
+        sections = self.parser.parse_sections(text)
+        for k in ("abstract", "introduction", "method", "experiments", "conclusion"):
+            assert k in sections
+
+
+class TestPhase3VisionConfig:
+    """Phase 3.2: vision 模型 env 隔离 + cache + prompt safety"""
+
+    def test_vision_uses_separate_env(self, monkeypatch):
+        from src.core.multimodal import FigureAnalyzer
+        monkeypatch.setenv("MINIMAX_VISION_MODEL", "abab6.5s-chat")
+        monkeypatch.setenv("MINIMAX_MODEL", "MiniMax-M2")
+        fa = FigureAnalyzer()
+        assert fa.model == "abab6.5s-chat",             "vision should use MINIMAX_VISION_MODEL not MINIMAX_MODEL"
+
+    def test_vision_falls_back_to_default(self, monkeypatch):
+        from src.core.multimodal import FigureAnalyzer
+        monkeypatch.delenv("MINIMAX_VISION_MODEL", raising=False)
+        monkeypatch.setenv("MINIMAX_MODEL", "MiniMax-M2")
+        fa = FigureAnalyzer()
+        # 没有 vision env 时回到默认（不再误用 MINIMAX_MODEL）
+        assert fa.model == "MiniMax-Text-01"
+
+    def test_cache_toggle(self):
+        from src.core.multimodal import FigureAnalyzer
+        fa_on = FigureAnalyzer(enable_cache=True)
+        fa_off = FigureAnalyzer(enable_cache=False)
+        assert fa_on._cache is not None
+        assert fa_off._cache is None
+
+
+class TestPhase3CaptionExtraction:
+    """Phase 3.3: caption 检测 + 正文引用"""
+
+    def test_caption_regex_requires_punctuation(self):
+        """Figure X without :/. is NOT a caption (avoids body false positives)."""
+        from src.core.pdf_parser import PDFParser
+        # 用 _CAPTION_PATTERNS 直接测，不依赖 PDF 文件
+        ok_cases = [
+            "Figure 1: Comparison of methods",
+            "Fig. 2. The architecture",
+            "Table 3: Results",
+            "图 1: 系统框图",
+        ]
+        bad_cases = [
+            "Figure 5 in Section 4",  # no punctuation
+            "Table 1 shows accuracy",  # no punctuation
+            "see Figure 2 for details",  # body reference
+        ]
+        for line in ok_cases:
+            matched = any(p.match(line) for p in PDFParser._CAPTION_PATTERNS)
+            assert matched, f"should match: {line!r}"
+        for line in bad_cases:
+            matched = any(p.match(line) for p in PDFParser._CAPTION_PATTERNS)
+            assert not matched, f"should NOT match: {line!r}"

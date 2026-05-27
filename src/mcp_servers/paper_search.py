@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import sys
 from pathlib import Path as _Path
 _PROJECT_ROOT = _Path(__file__).parent.parent.parent
@@ -36,7 +38,8 @@ from typing import Optional
 
 import httpx
 from dotenv import load_dotenv
-from mcp.server.fastmcp import FastMCP
+
+from ._mcp_compat import make_fastmcp_or_stub
 
 # ============================================================
 # 环境加载与日志配置
@@ -52,7 +55,7 @@ logger = logging.getLogger("ScholarMind.PaperSearch")
 # ============================================================
 # MCP Server 初始化
 # ============================================================
-mcp = FastMCP(
+mcp = make_fastmcp_or_stub(
     "ScholarMind-PaperSearch",
     instructions=(
         "学术论文搜索与检索服务。"
@@ -210,22 +213,22 @@ async def search_papers(
     fields_of_study: str | None = None,
 ) -> str:
     """
-    通过 Semantic Scholar API 搜索学术论文。搜索结果来自真实的学术数据库，
-    每篇论文都有唯一的 Paper ID 可以验证。
+    通过 Semantic Scholar API 搜索学术论文。**备选搜索源**——首选 `search_arxiv`。
 
-    适合使用的场景：
-    - 用户说"帮我找关于xxx的论文"
-    - 用户说"xxx领域有哪些最新研究"
-    - 进行文献综述时需要收集相关论文
-    - 验证某个研究方向是否有已有工作
+    ⚠️ **优先级提示** (Phase 4.1)：本工具无 API Key 时极易触发 429 限流（1 req/s）；
+    建议默认走 `search_arxiv`（公开 API 无限速）或 `search_crossref`（DOI 元数据强）。
+    仅在以下场景才用本工具：
+    - 需要引用数（citationCount）/ TL;DR / 完整 venue 信息
+    - 已经有 Paper ID 想拿详情（→ 用 get_paper_details）
+    - arXiv + CrossRef 都搜不到的论文
 
     不适合使用的场景：
-    - 用户已经提供了论文 PDF，不需要再搜索
+    - 用户已经提供了论文 PDF（→ 用 ingest_local_pdf）
     - 用户在讨论已知论文的细节
 
     Args:
         query: 搜索关键词。使用英文效果最好。
-               例如 "ISAC channel estimation" 或 "RIS aided sensing MIMO"
+               例如 "LLM Agent memory"、"agent tool use" 或 "multi-agent collaboration"
         limit: 返回论文数量，1-10 之间，默认 5
         year_range: 可选的发表年份过滤，格式 "2020-2025" 或 "2024-"
         fields_of_study: 可选的学科过滤，如 "Computer Science"、"Engineering"
@@ -260,7 +263,7 @@ async def search_papers(
                 f"**建议**：\n"
                 f"- 尝试使用更通用的英文关键词\n"
                 f"- 减少过滤条件（如去掉年份限制）\n"
-                f"- 尝试同义词（如 'sensing' → 'radar'）"
+                f"- 尝试同义词（如 'agent memory' → 'long-term memory'）"
             )
 
         # 格式化结果
@@ -312,7 +315,7 @@ async def search_papers(
             "Semantic Scholar API 响应超时（30秒），网络不稳定或服务繁忙。\n\n"
             "**请立即调用 `search_arxiv` 工具进行备选搜索**，"
             f"使用相同的查询词: \"{query}\"。\n"
-            "arXiv API 通常更稳定，且覆盖了大多数计算机科学和通信领域论文。"
+            "arXiv API 通常更稳定，且覆盖了大多数计算机科学与大模型 Agent 相关论文。"
         )
     except httpx.HTTPStatusError as e:
         status = e.response.status_code
@@ -496,34 +499,61 @@ async def search_arxiv(
     query: str,
     limit: int = 5,
     sort_by: str = "relevance",
+    category: str = "",
+    author: str = "",
+    recent_days: int = 0,
 ) -> str:
     """
-    通过 arXiv API 搜索预印本论文。arXiv 是物理、数学、计算机科学等领域的
-    开放获取预印本平台，很多最新研究会先在这里发布。
+    通过 arXiv API 搜索预印本论文。**推荐作为搜索主路径**（公开 API 无 Key 无限速）。
 
-    与 search_papers 的区别：
-    - arXiv 偏向最新的预印本（可能尚未正式发表）
-    - search_papers（Semantic Scholar）覆盖更广、引用数据更全
-    - 建议两者结合使用以获得全面的文献覆盖
+    Phase 4.1 增强：
+    - category 过滤（cs.AI / cs.CL / cs.LG / cs.IR / eess.SP ...）
+    - author 过滤（作者名）
+    - recent_days 过滤（最近 N 天的提交，配合 sortBy="submittedDate"）
+
+    适合使用的场景：
+    - 用户找 LLM Agent / 通信 / SLAM 等领域的论文（默认走这里）
+    - 想要最新预印本
+    - 按作者列搜某个研究者发表
+
+    与 search_papers 的对比：
+    - **search_arxiv（本工具）**：公开无 key，覆盖 CS/物理/数学/工程
+    - **search_papers (Semantic Scholar)**：备选，无 API key 易触 429；引用数据完整时调它
 
     Args:
-        query: 搜索关键词（英文），例如 "integrated sensing communication"
-        limit: 返回数量，1-10，默认 5
-        sort_by: 排序方式
-                 - "relevance": 按相关性（默认）
-                 - "lastUpdatedDate": 按最近更新
-                 - "submittedDate": 按提交时间
+        query: 关键词（英文最佳）
+        limit: 返回数量，1-10
+        sort_by: relevance / lastUpdatedDate / submittedDate
+        category: arXiv 分类前缀，如 "cs.AI" / "cs.CL" / "eess.SP"。空则不过滤
+        author: 作者姓名（部分匹配）
+        recent_days: 仅返回最近 N 天提交的论文。>0 时建议 sort_by="submittedDate"
 
     Returns:
-        arXiv 论文列表，每篇包含标题、作者、arXiv ID 和摘要。
+        arXiv 论文列表（标题/作者/arXiv ID/摘要/PDF 链接）
     """
-    logger.info(f"arXiv 搜索: query='{query}', limit={limit}")
+    logger.info(
+        f"arXiv 搜索: q='{query}', limit={limit}, cat={category!r}, "
+        f"author={author!r}, recent_days={recent_days}"
+    )
 
     limit = max(1, min(limit, MAX_RESULTS_PER_SEARCH))
+
+    # 构造 search_query（arXiv 用 AND 组合多字段）
+    parts = []
+    if query:
+        parts.append(f"all:{query}")
+    if category:
+        parts.append(f"cat:{category}")
+    if author:
+        parts.append(f"au:{author}")
+    if not parts:
+        return "⚠️ 至少提供 query / category / author 中的一个参数"
+
+    search_query = " AND ".join(parts)
     params = {
-        "search_query": f"all:{query}",
+        "search_query": search_query,
         "start": 0,
-        "max_results": limit,
+        "max_results": limit if recent_days <= 0 else min(limit * 3, 30),
         "sortBy": sort_by,
         "sortOrder": "descending",
     }
@@ -547,8 +577,27 @@ async def search_arxiv(
 
         entries = root.findall("atom:entry", ns)
 
+        # recent_days 后过滤
+        if recent_days > 0 and entries:
+            from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+            cutoff = _dt.now(_tz.utc) - _td(days=recent_days)
+            filtered = []
+            for e in entries:
+                pub = e.findtext("atom:published", "", ns)[:10]
+                if pub:
+                    try:
+                        d = _dt.strptime(pub, "%Y-%m-%d").replace(tzinfo=_tz.utc)
+                        if d >= cutoff:
+                            filtered.append(e)
+                    except ValueError:
+                        pass
+            entries = filtered[:limit]
+
         if not entries:
-            return f"## arXiv 搜索未找到结果\n\n关键词: \"{query}\""
+            note = ""
+            if recent_days > 0:
+                note = f"（最近 {recent_days} 天内无新提交）"
+            return f"## arXiv 搜索未找到结果\n\n关键词: \"{query}\" {note}"
 
         results = []
         for i, entry in enumerate(entries, 1):
@@ -599,6 +648,506 @@ async def search_arxiv(
     except Exception as e:
         logger.exception(f"arXiv 搜索失败: {e}")
         return f"⚠️ **arXiv 搜索失败**: {type(e).__name__}: {e}"
+
+
+# ============================================================
+# Phase 4.3: 本地 PDF intake
+# ============================================================
+
+def _extract_local_pdf_metadata(pdf_path: str) -> dict:
+    """从本地 PDF 提取元数据：fitz metadata + 头页文本启发式。
+
+    返回字段：title / authors (list) / year / arxiv_id / venue / file_hash / abstract_snippet
+    缺失字段为空（""/[]/None）。
+    """
+    from src.core.pdf_parser import PDFParser
+    from src.core.paper_registry import _compute_file_hash, _extract_arxiv_id_from_filename
+    from pathlib import Path as _P
+    import re as _re
+
+    result = {
+        "title": "", "authors": [], "year": None, "arxiv_id": None,
+        "venue": "", "file_hash": "", "abstract_snippet": "",
+    }
+    p = _P(pdf_path)
+    if not p.exists():
+        return result
+
+    # 1) file hash + 文件名 arxiv id
+    result["file_hash"] = _compute_file_hash(p)
+    result["arxiv_id"] = _extract_arxiv_id_from_filename(p.name)
+
+    try:
+        with PDFParser(pdf_path) as parser:
+            meta = parser.get_metadata()
+            if meta.title and len(meta.title) > 3:
+                result["title"] = meta.title.strip()
+            if meta.author:
+                # PDF metadata author 字段可能逗号或分号分隔
+                authors = _re.split(r"[,;]\s*", meta.author)
+                result["authors"] = [a.strip() for a in authors if a.strip()][:10]
+
+            # 2) 从第一页文本启发式提元数据
+            head_text = parser.extract_page_text(0, fix_columns=True)
+
+            # 找 abstract 片段（前 500 char 给 KG 用）
+            m = _re.search(r"(?:abstract|摘\s*要)[\.:：\s]+", head_text, _re.IGNORECASE)
+            if m:
+                snippet = head_text[m.end(): m.end() + 800]
+                # 截到下个章节标题
+                end_m = _re.search(r"\n\s*(?:1\.|I\.|introduction|引言|##\s*1)", snippet, _re.IGNORECASE)
+                if end_m:
+                    snippet = snippet[:end_m.start()]
+                result["abstract_snippet"] = snippet.strip()[:500]
+
+            # 头页前几行常常含标题（如果 PDF metadata title 缺失/低质）
+            # 启发：跳过页眉/期刊/日期；接受全大写（很多论文标题就是全大写）；
+            # 跳过含 email 的作者行；最多合并 2 行长标题（如 "REACT: ...\nLANGUAGE MODELS"）
+            _HEADER_NOISE = _re.compile(
+                r"^(?:published|preprint|arxiv:?|under\s+review|technical\s+report|"
+                r"workshop\s+paper|nips|iclr|icml|aaai|emnlp|acl|under\s+submission|"
+                r"to\s+appear|accepted|copyright|©|abstract\b|provided\s+proper\s+attribution|"
+                # 期刊页眉模式: "Front. Comput. Sci., 2025, 0(0): 1-42" / "IEEE Trans..."
+                r"front\.|ieee\s+(?:trans|conf|proc)|j\.\s+[A-Z]|"
+                r"\d{4}\b)",
+                _re.IGNORECASE,
+            )
+            if not result["title"]:
+                first_lines = [l.strip() for l in head_text.split("\n")[:20] if l.strip()]
+                # 找到第一行有效候选
+                first_idx = None
+                for i, line in enumerate(first_lines):
+                    if not (5 <= len(line) <= 200):
+                        continue
+                    if _HEADER_NOISE.match(line):
+                        continue
+                    if "@" in line and "." in line.split("@")[-1]:
+                        continue
+                    first_idx = i
+                    break
+
+                if first_idx is not None:
+                    first_line = first_lines[first_idx]
+                    # 全大写 → 多半是 multi-line 标题，尝试 join 下一行（如果也全大写）
+                    if first_line.isupper() and first_idx + 1 < len(first_lines):
+                        nxt = first_lines[first_idx + 1]
+                        if (nxt.isupper() and 5 <= len(nxt) <= 100
+                                and not _HEADER_NOISE.match(nxt)
+                                and "@" not in nxt):
+                            first_line = first_line + " " + nxt
+                    result["title"] = first_line.strip()
+
+            # 年份：搜寻 19xx/20xx 模式（取最高频）
+            years = _re.findall(r"\b(19[89]\d|20[0-2]\d)\b", head_text[:3000])
+            if years:
+                # 取出现次数最多的（论文通常自我引用发表年）
+                from collections import Counter
+                result["year"] = int(Counter(years).most_common(1)[0][0])
+
+            # arXiv ID 进一步搜索（如果文件名没拿到）
+            if not result["arxiv_id"]:
+                m = _re.search(r"arXiv:?\s*(\d{4}\.\d{4,5})", head_text[:2000])
+                if m:
+                    result["arxiv_id"] = m.group(1)
+
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"PDF metadata 提取部分失败: {e}")
+
+    return result
+
+
+@mcp.tool()
+async def ingest_local_pdf(
+    pdf_path: str,
+    hint_title: str = "",
+    hint_arxiv_id: str = "",
+    domain: str = "",
+    add_to_kg: bool = False,
+    first_seen_date: str = "",
+) -> str:
+    """
+    一站式吃下一篇本地 PDF：去重 → 抽元数据 → 注册到 paper_registry → 可选入图谱。
+
+    适合使用的场景：
+    - 用户把 IEEE/ACM/Springer 等闭源期刊论文手动下载到 data/papers/ 后
+    - 用户说"把这篇加入"或"刚下了一篇新论文"
+    - 批量整理已经下载的 PDF 时（更适合用 batch_ingest_directory）
+
+    流程：
+      1. 计算 file_hash → check_duplicate（已存在直接返回老记录）
+      2. 从 fitz metadata + 头页文本启发式提取 title/authors/year/arxiv_id
+      3. paper_registry.register_paper
+      4. 若 add_to_kg=True：触发 add_paper_to_graph(domain, first_seen_year=first_seen_date)
+
+    Args:
+        pdf_path: 本地 PDF 路径（绝对或相对项目根）
+        hint_title: 覆写抽到的 title（提取不准时可手动给）
+        hint_arxiv_id: 覆写抽到的 arxiv_id
+        domain: KG 目标域，仅 add_to_kg=True 时用
+        add_to_kg: 注册后是否自动入 KG（默认 False，让用户先看元数据）
+        first_seen_date: 你首次看到这篇论文的 YYYY 或 YYYY-MM-DD
+
+    Returns:
+        intake 报告（已注册/新增 + 元数据 + KG 状态）
+    """
+    from src.core.paper_registry import PaperRegistry, PaperRecord
+    from pathlib import Path as _P
+    logger.info(f"ingest_local_pdf: {pdf_path}")
+
+    p = _P(pdf_path)
+    if not p.exists():
+        return f"⚠️ **文件不存在**: `{pdf_path}`"
+    if not p.suffix.lower() == ".pdf":
+        return f"⚠️ **不是 PDF 文件**: `{p.name}`"
+
+    registry = PaperRegistry()
+    meta = _extract_local_pdf_metadata(str(p))
+    if hint_title:
+        meta["title"] = hint_title
+    if hint_arxiv_id:
+        meta["arxiv_id"] = hint_arxiv_id
+
+    # 去重
+    dup = registry.check_duplicate(
+        arxiv_id=meta.get("arxiv_id"),
+        title=meta.get("title"),
+        file_hash=meta.get("file_hash"),
+    )
+    if dup:
+        return (
+            f"✅ **已注册（无需重复入库）**\n\n"
+            + registry.format_duplicate_warning(dup)
+            + '\n\n如需重新入图谱，请明确说 "重新抽取并入图"。'
+        )
+
+    # 注册
+    record = PaperRecord(
+        title=meta["title"] or p.stem,
+        local_path=str(p.as_posix()),
+        arxiv_id=meta.get("arxiv_id"),
+        authors=meta.get("authors", []),
+        year=meta.get("year"),
+        file_hash=meta.get("file_hash", ""),
+        tags=["local-intake"],
+        first_seen_date=first_seen_date or "",
+    )
+    registry.register_paper(record)
+
+    lines = [
+        "✅ **本地 PDF intake 完成**",
+        "",
+        f"| 字段 | 值 |",
+        f"|:---|:---|",
+        f"| 标题 | {record.title[:80]} |",
+        f"| arXiv ID | {record.arxiv_id or '—'} |",
+        f"| 年份 | {record.year or '—'} |",
+        f"| 作者 | {', '.join(record.authors[:3]) or '—'} |",
+        f"| 文件哈希 | `{record.file_hash}` |",
+        f"| 本地路径 | `{record.local_path}` |",
+        f"| 首次看到 | {record.first_seen_date or '—'} |",
+    ]
+    if meta.get("abstract_snippet"):
+        lines.append("")
+        lines.append(f"**摘要片段**: {meta['abstract_snippet'][:300]}...")
+
+    # 可选入图谱
+    if add_to_kg:
+        try:
+            from src.mcp_servers.knowledge_graph import add_paper_to_graph
+            lines.append("")
+            lines.append("--- KG 入图 ---")
+            kg_result = await add_paper_to_graph(
+                pdf_path=str(p),
+                paper_title=record.title,
+                paper_year=str(record.year) if record.year else "",
+                domain=domain,
+                first_seen_year=first_seen_date,
+            )
+            lines.append(kg_result[:1500])
+        except Exception as e:  # noqa: BLE001
+            lines.append(f"⚠️ KG 入图失败（不阻塞 intake）：{e}")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def batch_ingest_directory(
+    dir_path: str = "data/papers",
+    domain: str = "",
+    add_to_kg: bool = False,
+    limit: int = 0,
+) -> str:
+    """
+    扫描目录里所有 PDF 批量 intake。已注册的跳过，新论文按 ingest_local_pdf 流程处理。
+
+    适合使用的场景：
+    - 你下载了一批 IEEE/ACM 论文到 data/papers/，想一次性整理
+    - 重新初始化 paper_registry 时
+
+    Args:
+        dir_path: 扫描目录（默认 data/papers）
+        domain: 入图时的域
+        add_to_kg: 是否每篇都 add_paper_to_graph（慢，按需开启）
+        limit: 0=全部；>0 仅处理前 N 个
+
+    Returns:
+        逐文件 intake 报告（行数 = PDF 数 + 摘要表头）
+    """
+    from src.core.paper_registry import PaperRegistry
+    from pathlib import Path as _P
+    p = _P(dir_path)
+    if not p.exists() or not p.is_dir():
+        return f"⚠️ **目录不存在**: `{dir_path}`"
+
+    pdfs = sorted(p.glob("*.pdf"))
+    if limit > 0:
+        pdfs = pdfs[:limit]
+    if not pdfs:
+        return f"📁 目录 `{dir_path}` 下没有 PDF 文件"
+
+    logger.info(f"batch_ingest_directory: {len(pdfs)} PDFs, add_to_kg={add_to_kg}")
+    registry = PaperRegistry()
+
+    lines = [
+        f"## 📥 批量 intake: `{dir_path}` ({len(pdfs)} files)",
+        "",
+        "| # | 文件 | 状态 | 标题/arXiv ID |",
+        "|---:|:---|:---|:---|",
+    ]
+    n_new, n_dup, n_err = 0, 0, 0
+    for i, pdf in enumerate(pdfs, 1):
+        try:
+            meta = _extract_local_pdf_metadata(str(pdf))
+            dup = registry.check_duplicate(
+                arxiv_id=meta.get("arxiv_id"),
+                title=meta.get("title"),
+                file_hash=meta.get("file_hash"),
+            )
+            if dup:
+                n_dup += 1
+                lines.append(
+                    f"| {i} | `{pdf.name[:30]}` | 🔁 已存在 | {dup.title[:50]} |"
+                )
+                continue
+
+            # 直接调 ingest_local_pdf 复用所有逻辑
+            await ingest_local_pdf(
+                pdf_path=str(pdf),
+                domain=domain,
+                add_to_kg=add_to_kg,
+            )
+            n_new += 1
+            label = meta.get("arxiv_id") or (meta.get("title") or "")[:40]
+            lines.append(f"| {i} | `{pdf.name[:30]}` | ✅ 新增 | {label} |")
+        except Exception as e:  # noqa: BLE001
+            n_err += 1
+            lines.append(f"| {i} | `{pdf.name[:30]}` | ❌ 失败 | {str(e)[:50]} |")
+            logger.exception(f"intake {pdf.name} 失败")
+
+    lines += [
+        "",
+        f"**汇总**：新增 {n_new} · 已存在 {n_dup} · 失败 {n_err} · 总计 {len(pdfs)}",
+    ]
+    if add_to_kg and n_new > 0:
+        lines.append(f"\n⚠️ 已对新论文执行 add_paper_to_graph（domain={domain or 'default'}）")
+    return "\n".join(lines)
+
+
+# ============================================================
+# Phase 4.2: 接入 OpenReview / CrossRef / DBLP（公开 API 无 key）
+# ============================================================
+
+@mcp.tool()
+async def search_crossref(query: str, limit: int = 5) -> str:
+    """
+    通过 CrossRef 公开 API 搜索学术论文（无需 API Key，DOI 元数据强）。
+
+    适合使用的场景：
+    - 已知 DOI 想拿元数据
+    - Semantic Scholar 拿不到结果时的备选
+    - 找一篇有 DOI 的论文的标题/作者/年份
+
+    Args:
+        query: 关键词或标题（英文最佳）
+        limit: 返回数量，1-20，默认 5
+
+    Returns:
+        论文列表（标题/作者/年份/DOI/journal）
+    """
+    logger.info(f"CrossRef 搜索: query='{query}', limit={limit}")
+    limit = max(1, min(limit, 20))
+
+    try:
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT, follow_redirects=True) as client:
+            resp = await client.get(
+                "https://api.crossref.org/works",
+                params={"query": query, "rows": limit, "select": "DOI,title,author,issued,container-title,abstract"},
+                headers={"User-Agent": "ScholarMind/0.1 (academic; mailto:noreply@example.com)"},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+    except httpx.TimeoutException:
+        return "⚠️ **CrossRef 搜索超时**，请稍后重试。"
+    except httpx.HTTPStatusError as e:
+        return f"⚠️ **CrossRef 错误** (HTTP {e.response.status_code})"
+    except Exception as e:  # noqa: BLE001
+        return f"⚠️ **CrossRef 失败**: {type(e).__name__}: {e}"
+
+    items = data.get("message", {}).get("items", [])
+    if not items:
+        return f"## CrossRef 未找到结果\n\n关键词: \"{query}\""
+
+    results = []
+    for i, w in enumerate(items, 1):
+        title = (w.get("title") or [""])[0]
+        doi = w.get("DOI", "")
+        authors_list = w.get("author") or []
+        authors = ", ".join(
+            f"{a.get('given', '')} {a.get('family', '')}".strip()
+            for a in authors_list[:3]
+        )
+        if len(authors_list) > 3:
+            authors += " et al."
+        year = ""
+        issued = w.get("issued", {}).get("date-parts") or []
+        if issued and issued[0]:
+            year = str(issued[0][0])
+        venue = (w.get("container-title") or [""])[0]
+        abstract = _truncate(w.get("abstract", ""), 200)
+
+        results.append(
+            f"### [{i}] {title or '(无标题)'}\n"
+            f"- **作者**: {authors or '—'}\n"
+            f"- **年份**: {year or '—'} | **期刊**: {venue or '—'}\n"
+            f"- **DOI**: [{doi}](https://doi.org/{doi})\n"
+            + (f"- **摘要**: {abstract}\n" if abstract else "")
+        )
+
+    return f"## 🔍 CrossRef 搜索: \"{query}\"\n\n" + "\n---\n".join(results)
+
+
+@mcp.tool()
+async def search_openreview(query: str, venue: str = "", year: int = 0, limit: int = 5) -> str:
+    """
+    通过 OpenReview API 搜索 ICLR/NeurIPS 等公开 review 的论文。
+
+    适合使用的场景：
+    - 找 ICLR/NeurIPS 论文（含 review 内容）
+    - 关心论文的 reviewer 评分
+    - arXiv 上拿不到 venue 信息时
+
+    Args:
+        query: 关键词
+        venue: 可选会议代号（ICLR.cc, NeurIPS.cc, 留空不限）
+        year: 可选年份过滤
+        limit: 返回数量
+
+    Returns:
+        论文列表（标题/作者/venue/链接）
+    """
+    logger.info(f"OpenReview 搜索: query='{query}', venue='{venue}', year={year}")
+    limit = max(1, min(limit, 20))
+    # OpenReview v2 API: GET /notes/search?term=
+    params = {"term": query, "limit": limit, "type": "all"}
+    if venue:
+        params["group"] = venue
+    if year > 0:
+        params["term"] = f"{query} {year}"
+
+    try:
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT, follow_redirects=True) as client:
+            resp = await client.get(
+                "https://api2.openreview.net/notes/search",
+                params=params,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+    except httpx.TimeoutException:
+        return "⚠️ **OpenReview 搜索超时**。"
+    except httpx.HTTPStatusError as e:
+        return f"⚠️ **OpenReview 错误** (HTTP {e.response.status_code})"
+    except Exception as e:  # noqa: BLE001
+        return f"⚠️ **OpenReview 失败**: {type(e).__name__}: {e}"
+
+    notes = data.get("notes", [])
+    if not notes:
+        return f"## OpenReview 未找到结果\n\n关键词: \"{query}\""
+
+    results = []
+    for i, n in enumerate(notes[:limit], 1):
+        content = n.get("content", {})
+        title = content.get("title", {}).get("value", "(无标题)") if isinstance(content.get("title"), dict) else content.get("title", "")
+        venue_str = content.get("venue", {}).get("value", "") if isinstance(content.get("venue"), dict) else content.get("venue", "")
+        authors_val = content.get("authors", {})
+        authors_list = authors_val.get("value", []) if isinstance(authors_val, dict) else (authors_val or [])
+        authors = ", ".join(authors_list[:3])
+        if len(authors_list) > 3:
+            authors += " et al."
+        forum = n.get("forum", "")
+        results.append(
+            f"### [{i}] {title}\n"
+            f"- **作者**: {authors or '—'}\n"
+            f"- **Venue**: {venue_str or '—'}\n"
+            f"- **链接**: https://openreview.net/forum?id={forum}\n"
+        )
+    return f"## 🔍 OpenReview 搜索: \"{query}\"\n\n" + "\n---\n".join(results)
+
+
+@mcp.tool()
+async def search_dblp(author_or_query: str, limit: int = 10) -> str:
+    """
+    通过 DBLP 公开 API 查找作者及其论文（无 key）。
+
+    适合使用的场景：
+    - 想看某个研究者的发表列表
+    - arXiv 没有完整论文列表的领域权威
+
+    Args:
+        author_or_query: 作者名或关键词（DBLP 通用搜索）
+        limit: 返回数量
+
+    Returns:
+        论文列表（标题/作者/venue/年份）
+    """
+    logger.info(f"DBLP 搜索: q='{author_or_query}', limit={limit}")
+    limit = max(1, min(limit, 30))
+    try:
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT, follow_redirects=True) as client:
+            resp = await client.get(
+                "https://dblp.org/search/publ/api",
+                params={"q": author_or_query, "format": "json", "h": limit},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+    except httpx.TimeoutException:
+        return "⚠️ **DBLP 搜索超时**。"
+    except Exception as e:  # noqa: BLE001
+        return f"⚠️ **DBLP 失败**: {type(e).__name__}: {e}"
+
+    hits = data.get("result", {}).get("hits", {}).get("hit", [])
+    if not hits:
+        return f"## DBLP 未找到结果\n\n查询: \"{author_or_query}\""
+
+    results = []
+    for i, h in enumerate(hits, 1):
+        info = h.get("info", {})
+        title = info.get("title", "(无标题)")
+        year = info.get("year", "")
+        venue = info.get("venue", "")
+        authors_info = info.get("authors", {}).get("author", [])
+        if isinstance(authors_info, dict):
+            authors_info = [authors_info]
+        authors = ", ".join(a.get("text", "") for a in authors_info[:3])
+        if len(authors_info) > 3:
+            authors += " et al."
+        doi = info.get("doi", "")
+        url = info.get("url", "")
+        results.append(
+            f"**[{i}]** {title}\n"
+            f"  - {authors or '—'} | {venue} | {year}\n"
+            f"  - DBLP: {url}" + (f" | DOI: {doi}" if doi else "")
+        )
+    return f"## 🔍 DBLP 搜索: \"{author_or_query}\"\n\n" + "\n\n".join(results)
 
 
 # ============================================================

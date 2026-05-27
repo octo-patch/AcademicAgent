@@ -31,11 +31,17 @@ from src.knowledge.graph_store import KnowledgeGraphStore
 class TestNodeType:
     """节点类型枚举测试"""
 
-    def test_all_types_exist(self):
-        """验证所有预期的节点类型都已定义"""
-        expected = {"paper", "author", "concept", "method", "dataset", "metric", "tool"}
+    def test_core_types_exist(self):
+        """验证核心节点类型仍然存在（向后兼容）"""
+        core = {"paper", "author", "concept", "method", "dataset", "metric", "tool"}
         actual = {t.value for t in NodeType}
-        assert actual == expected
+        assert core.issubset(actual), f"missing core types: {core - actual}"
+
+    def test_extended_types_exist(self):
+        """2026-05-20 扩展类型：framework/benchmark/hardware_platform/system/other"""
+        extended = {"framework", "benchmark", "hardware_platform", "system", "other"}
+        actual = {t.value for t in NodeType}
+        assert extended.issubset(actual), f"missing extended types: {extended - actual}"
 
     def test_string_conversion(self):
         """枚举值可正确转换为字符串"""
@@ -46,15 +52,21 @@ class TestNodeType:
 class TestRelationType:
     """关系类型枚举测试"""
 
-    def test_all_types_exist(self):
-        """验证所有预期的关系类型都已定义"""
-        expected = {
+    def test_core_types_exist(self):
+        """验证核心关系类型仍然存在（向后兼容）"""
+        core = {
             "proposes", "uses", "improves", "extends",
             "compares_with", "cites", "authored_by",
             "evaluated_by", "belongs_to", "related_to", "tested_on",
         }
         actual = {t.value for t in RelationType}
-        assert actual == expected
+        assert core.issubset(actual), f"missing core types: {core - actual}"
+
+    def test_extended_types_exist(self):
+        """2026-05-20 扩展类型：enables/requires/pretrained_on/evaluated_against/supersedes"""
+        extended = {"enables", "requires", "pretrained_on", "evaluated_against", "supersedes"}
+        actual = {t.value for t in RelationType}
+        assert extended.issubset(actual), f"missing extended types: {extended - actual}"
 
 
 class TestKGNode:
@@ -62,28 +74,28 @@ class TestKGNode:
 
     def test_node_id_generation(self):
         """验证节点 ID 的自动生成"""
-        node = KGNode(label="OFDM", node_type=NodeType.CONCEPT)
-        assert node.node_id == "concept_ofdm"
+        node = KGNode(label="ReAct", node_type=NodeType.CONCEPT)
+        assert node.node_id == "concept_react"
 
     def test_node_id_normalization(self):
         """验证标签标准化（大小写不敏感、去特殊字符）"""
-        n1 = KGNode(label="OFDM", node_type=NodeType.CONCEPT)
-        n2 = KGNode(label="ofdm", node_type=NodeType.CONCEPT)
-        n3 = KGNode(label="Ofdm", node_type=NodeType.CONCEPT)
+        n1 = KGNode(label="ReAct", node_type=NodeType.CONCEPT)
+        n2 = KGNode(label="react", node_type=NodeType.CONCEPT)
+        n3 = KGNode(label="REACT", node_type=NodeType.CONCEPT)
         assert n1.node_id == n2.node_id == n3.node_id
 
     def test_node_id_with_spaces(self):
         """验证带空格的标签标准化"""
         node = KGNode(
-            label="Hybrid Beamforming",
+            label="Plan and Execute",
             node_type=NodeType.METHOD,
         )
-        assert node.node_id == "method_hybrid_beamforming"
+        assert node.node_id == "method_plan_and_execute"
 
     def test_paper_node_id_uses_hash(self):
         """论文节点使用 hash 避免 ID 过长"""
         node = KGNode(
-            label="A Very Long Paper Title About ISAC Systems",
+            label="A Very Long Paper Title About LLM Agents",
             node_type=NodeType.PAPER,
         )
         assert node.node_id.startswith("paper_")
@@ -92,7 +104,7 @@ class TestKGNode:
     def test_merge_properties(self):
         """验证属性合并"""
         node = KGNode(
-            label="OFDM",
+            label="ReAct",
             node_type=NodeType.CONCEPT,
             properties={"definition": "short def"},
         )
@@ -103,30 +115,30 @@ class TestKGNode:
     def test_merge_list_properties(self):
         """验证列表类型属性合并去重"""
         node = KGNode(
-            label="OFDM",
+            label="ReAct",
             node_type=NodeType.CONCEPT,
-            properties={"domains": ["5G", "WiFi"]},
+            properties={"domains": ["Planning", "Tool Use"]},
         )
-        node.merge_properties({"domains": ["WiFi", "6G"]})
-        assert "5G" in node.properties["domains"]
-        assert "6G" in node.properties["domains"]
-        # WiFi 不应重复
-        wifi_count = sum(1 for d in node.properties["domains"] if d == "WiFi")
-        assert wifi_count == 1
+        node.merge_properties({"domains": ["Tool Use", "Memory"]})
+        assert "Planning" in node.properties["domains"]
+        assert "Memory" in node.properties["domains"]
+        # Tool Use 不应重复
+        tool_use_count = sum(1 for d in node.properties["domains"] if d == "Tool Use")
+        assert tool_use_count == 1
 
     def test_serialization(self):
         """验证序列化/反序列化"""
         node = KGNode(
-            label="MIMO",
+            label="MemGPT",
             node_type=NodeType.CONCEPT,
-            properties={"domain": "wireless"},
+            properties={"domain": "agent memory"},
             source_paper="Test Paper",
         )
         data = node.to_dict()
         restored = KGNode.from_dict(data)
-        assert restored.label == "MIMO"
+        assert restored.label == "MemGPT"
         assert restored.node_type == NodeType.CONCEPT
-        assert restored.properties["domain"] == "wireless"
+        assert restored.properties["domain"] == "agent memory"
         assert restored.node_id == node.node_id
 
 
@@ -136,17 +148,17 @@ class TestKGEdge:
     def test_edge_id(self):
         """验证边 ID 的格式"""
         edge = KGEdge(
-            source_id="concept_ofdm",
-            target_id="concept_mimo",
+            source_id="concept_react",
+            target_id="concept_memgpt",
             relation_type=RelationType.RELATED_TO,
         )
-        assert edge.edge_id == "concept_ofdm--related_to-->concept_mimo"
+        assert edge.edge_id == "concept_react--related_to-->concept_memgpt"
 
     def test_serialization(self):
         """验证边的序列化/反序列化"""
         edge = KGEdge(
             source_id="paper_abc123",
-            target_id="method_beamforming",
+            target_id="method_plan_and_execute",
             relation_type=RelationType.PROPOSES,
             confidence=0.9,
         )
@@ -170,13 +182,13 @@ class TestExtractionResult:
         """摘要输出格式"""
         result = ExtractionResult(
             nodes=[
-                KGNode(label="OFDM", node_type=NodeType.CONCEPT),
-                KGNode(label="BER", node_type=NodeType.METRIC),
+                KGNode(label="ReAct", node_type=NodeType.CONCEPT),
+                KGNode(label="Task Success Rate", node_type=NodeType.METRIC),
             ],
             edges=[
                 KGEdge(
-                    source_id="concept_ofdm",
-                    target_id="metric_ber",
+                    source_id="concept_react",
+                    target_id="metric_task_success_rate",
                     relation_type=RelationType.EVALUATED_BY,
                 ),
             ],
@@ -206,26 +218,26 @@ class TestKnowledgeGraphStore:
     def populated_store(self, store):
         """创建一个预填充的图谱"""
         # 添加节点
-        store.add_node(KGNode(label="OFDM", node_type=NodeType.CONCEPT))
-        store.add_node(KGNode(label="MIMO", node_type=NodeType.CONCEPT))
+        store.add_node(KGNode(label="ReAct", node_type=NodeType.CONCEPT))
+        store.add_node(KGNode(label="MemGPT", node_type=NodeType.CONCEPT))
         store.add_node(
             KGNode(
-                label="Hybrid Beamforming",
+                label="Plan and Execute",
                 node_type=NodeType.METHOD,
             )
         )
-        store.add_node(KGNode(label="BER", node_type=NodeType.METRIC))
+        store.add_node(KGNode(label="Task Success Rate", node_type=NodeType.METRIC))
         store.add_node(
             KGNode(
-                label="Some ISAC Paper",
+                label="Some Agent Paper",
                 node_type=NodeType.PAPER,
             )
         )
 
         # 添加边
-        paper_node = KGNode(label="Some ISAC Paper", node_type=NodeType.PAPER)
+        paper_node = KGNode(label="Some Agent Paper", node_type=NodeType.PAPER)
         method_node = KGNode(
-            label="Hybrid Beamforming", node_type=NodeType.METHOD
+            label="Plan and Execute", node_type=NodeType.METHOD
         )
 
         store.add_edge(
@@ -237,15 +249,15 @@ class TestKnowledgeGraphStore:
         )
         store.add_edge(
             KGEdge(
-                source_id="concept_ofdm",
-                target_id="concept_mimo",
+                source_id="concept_react",
+                target_id="concept_memgpt",
                 relation_type=RelationType.RELATED_TO,
             )
         )
         store.add_edge(
             KGEdge(
                 source_id=method_node.node_id,
-                target_id="metric_ber",
+                target_id="metric_task_success_rate",
                 relation_type=RelationType.EVALUATED_BY,
             )
         )
@@ -254,41 +266,41 @@ class TestKnowledgeGraphStore:
     def test_add_node(self, store):
         """验证添加节点"""
         node_id = store.add_node(
-            KGNode(label="OFDM", node_type=NodeType.CONCEPT)
+            KGNode(label="ReAct", node_type=NodeType.CONCEPT)
         )
-        assert node_id == "concept_ofdm"
+        assert node_id == "concept_react"
         assert store.node_count == 1
 
     def test_add_duplicate_node_merges(self, store):
         """验证重复节点合并"""
         store.add_node(
             KGNode(
-                label="OFDM",
+                label="ReAct",
                 node_type=NodeType.CONCEPT,
-                properties={"domain": "wireless"},
+                properties={"domain": "agent planning"},
             )
         )
         store.add_node(
             KGNode(
-                label="OFDM",
+                label="ReAct",
                 node_type=NodeType.CONCEPT,
-                properties={"definition": "multi-carrier"},
+                properties={"definition": "reasoning and acting"},
             )
         )
         assert store.node_count == 1  # 应该合并，不是新增
-        node = store.get_node("concept_ofdm")
+        node = store.get_node("concept_react")
         assert node is not None
         assert "domain" in node.properties
         assert "definition" in node.properties
 
     def test_add_edge(self, store):
         """验证添加边"""
-        store.add_node(KGNode(label="OFDM", node_type=NodeType.CONCEPT))
-        store.add_node(KGNode(label="MIMO", node_type=NodeType.CONCEPT))
+        store.add_node(KGNode(label="ReAct", node_type=NodeType.CONCEPT))
+        store.add_node(KGNode(label="MemGPT", node_type=NodeType.CONCEPT))
         edge_id = store.add_edge(
             KGEdge(
-                source_id="concept_ofdm",
-                target_id="concept_mimo",
+                source_id="concept_react",
+                target_id="concept_memgpt",
                 relation_type=RelationType.RELATED_TO,
             )
         )
@@ -297,10 +309,10 @@ class TestKnowledgeGraphStore:
 
     def test_add_edge_missing_node(self, store):
         """验证添加边时源/目标节点不存在的情况"""
-        store.add_node(KGNode(label="OFDM", node_type=NodeType.CONCEPT))
+        store.add_node(KGNode(label="ReAct", node_type=NodeType.CONCEPT))
         edge_id = store.add_edge(
             KGEdge(
-                source_id="concept_ofdm",
+                source_id="concept_react",
                 target_id="concept_nonexistent",
                 relation_type=RelationType.RELATED_TO,
             )
@@ -311,33 +323,33 @@ class TestKnowledgeGraphStore:
     def test_query_by_type(self, populated_store):
         """验证按类型查询"""
         concepts = populated_store.query_by_type(NodeType.CONCEPT)
-        assert len(concepts) == 2  # OFDM + MIMO
+        assert len(concepts) == 2  # ReAct + MemGPT
 
     def test_search_nodes(self, populated_store):
         """验证关键词搜索"""
-        results = populated_store.search_nodes("ofdm")
+        results = populated_store.search_nodes("react")
         assert len(results) >= 1
-        assert any(n.label == "OFDM" for n in results)
+        assert any(n.label == "ReAct" for n in results)
 
     def test_search_nodes_case_insensitive(self, populated_store):
         """验证大小写不敏感搜索"""
-        results1 = populated_store.search_nodes("OFDM")
-        results2 = populated_store.search_nodes("ofdm")
+        results1 = populated_store.search_nodes("ReAct")
+        results2 = populated_store.search_nodes("react")
         assert len(results1) == len(results2)
 
     def test_query_neighbors(self, populated_store):
         """验证邻居查询"""
-        neighbors = populated_store.query_neighbors("concept_ofdm", depth=1)
+        neighbors = populated_store.query_neighbors("concept_react", depth=1)
         assert len(neighbors) >= 1
         labels = [n.label for n, e in neighbors]
-        assert "MIMO" in labels
+        assert "MemGPT" in labels
 
     def test_remove_node(self, populated_store):
         """验证删除节点（含关联边）"""
         initial_edges = populated_store.edge_count
-        removed = populated_store.remove_node("concept_ofdm")
+        removed = populated_store.remove_node("concept_react")
         assert removed is True
-        assert populated_store.get_node("concept_ofdm") is None
+        assert populated_store.get_node("concept_react") is None
         assert populated_store.edge_count < initial_edges
 
     def test_save_and_load(self, populated_store):
@@ -379,3 +391,176 @@ class TestKnowledgeGraphStore:
         assert "知识图谱概览" in md
         assert "节点类型分布" in md
         assert "关系类型分布" in md
+
+
+
+# ============================================================
+# Phase 2: 新功能测试
+# ============================================================
+
+
+class TestPhase2EntityLinker:
+    """Entity Linking (Phase 2.1)"""
+
+    def test_alias_map_loads(self):
+        from src.knowledge.entity_linker import AliasMap
+        am = AliasMap()
+        assert am.size > 0, "aliases.yaml should provide aliases"
+
+    def test_alias_normalize_llm_agent(self):
+        from src.knowledge.entity_linker import AliasMap
+        am = AliasMap()
+        assert am.normalize("Reasoning and Acting") == "ReAct"
+        assert am.normalize("reasoning-and-acting") == "ReAct"
+        assert am.normalize("the ReAct framework") == "ReAct"
+
+    def test_alias_normalize_comms(self):
+        from src.knowledge.entity_linker import AliasMap
+        am = AliasMap()
+        assert am.normalize("Simultaneous Localization and Mapping") == "SLAM"
+        assert am.normalize("millimeter wave") == "mmWave"
+        assert am.normalize("Cramér-Rao lower bound") == "Cramer-Rao Lower Bound"
+
+    def test_alias_passthrough_unknown(self):
+        from src.knowledge.entity_linker import AliasMap
+        am = AliasMap()
+        assert am.normalize("some_truly_unknown_label_xyz") == "some_truly_unknown_label_xyz"
+
+    def test_entity_linker_link(self):
+        from src.knowledge.entity_linker import EntityLinker
+        from src.knowledge.graph_store import KnowledgeGraphStore
+        from src.knowledge.schema import KGNode, NodeType
+
+        store = KnowledgeGraphStore()
+        store.add_node(KGNode(label="ReAct", node_type=NodeType.METHOD))
+
+        linker = EntityLinker(store)
+        node = linker.link("Reasoning and Acting", "method")
+        assert node is not None
+        assert node.label == "ReAct"
+
+    def test_entity_linker_link_miss(self):
+        from src.knowledge.entity_linker import EntityLinker
+        from src.knowledge.graph_store import KnowledgeGraphStore
+        linker = EntityLinker(KnowledgeGraphStore())
+        assert linker.link("NotInGraph", "method") is None
+
+
+class TestPhase2Evidence:
+    """Evidence accumulation + conflict detection (Phase 2.3)"""
+
+    def test_evidence_accumulates_on_add_edge(self):
+        from src.knowledge.graph_store import KnowledgeGraphStore
+        from src.knowledge.schema import KGNode, KGEdge, NodeType, RelationType
+
+        store = KnowledgeGraphStore()
+        store.add_node(KGNode(label="A", node_type=NodeType.METHOD))
+        store.add_node(KGNode(label="B", node_type=NodeType.CONCEPT))
+
+        e1 = KGEdge(source_id="method_a", target_id="concept_b",
+                    relation_type=RelationType.USES, confidence=0.7,
+                    source_paper="PaperX")
+        store.add_edge(e1)
+        e2 = KGEdge(source_id="method_a", target_id="concept_b",
+                    relation_type=RelationType.USES, confidence=0.9,
+                    source_paper="PaperY")
+        store.add_edge(e2)
+
+        ev = store.get_evidence_for(e1.edge_id)
+        assert len(ev) == 2
+        # confidence should be max + boost
+        assert store._edges[e1.edge_id].confidence > 0.9
+
+    def test_conflict_detection(self):
+        from src.knowledge.graph_store import KnowledgeGraphStore
+        from src.knowledge.schema import KGNode, KGEdge, NodeType, RelationType
+
+        store = KnowledgeGraphStore()
+        store.add_node(KGNode(label="A", node_type=NodeType.METHOD))
+        store.add_node(KGNode(label="B", node_type=NodeType.METHOD))
+
+        e1 = KGEdge(source_id="method_a", target_id="method_b",
+                    relation_type=RelationType.IMPROVES, confidence=0.8,
+                    source_paper="X")
+        store.add_edge(e1)
+        e2 = KGEdge(source_id="method_a", target_id="method_b",
+                    relation_type=RelationType.SUPERSEDES, confidence=0.85,
+                    source_paper="Y")
+        store.add_edge(e2)
+
+        conflicts = store.get_conflicting_edges()
+        assert len(conflicts) == 2
+        assert all(e.properties.get("conflict") is True for e in conflicts)
+
+
+class TestPhase2TemporalFields:
+    """first_seen_year / first_seen_year_override (Phase 2.2)"""
+
+    def test_parse_extraction_passes_first_seen_year(self):
+        from src.knowledge.extractor import KnowledgeExtractor
+        ex = KnowledgeExtractor()
+        raw = '{"nodes":[{"label":"ReAct","node_type":"method","first_seen_year":2022}],"edges":[]}'
+        res = ex._parse_extraction(raw, "PaperZ")
+        assert res.nodes[0].first_seen_year == 2022
+
+    def test_first_seen_year_override(self):
+        from src.knowledge.extractor import KnowledgeExtractor
+        ex = KnowledgeExtractor()
+        raw = '{"nodes":[{"label":"ReAct","node_type":"method","first_seen_year":2022}],"edges":[]}'
+        res = ex._parse_extraction(raw, "PaperZ", first_seen_year_override=2026)
+        assert res.nodes[0].first_seen_year == 2026
+
+    def test_paper_record_first_seen_date(self):
+        from src.core.paper_registry import PaperRecord
+        r = PaperRecord(title="T", local_path="x", first_seen_date="2026-01-20")
+        r2 = PaperRecord.from_dict(r.to_dict())
+        assert r2.first_seen_date == "2026-01-20"
+
+
+class TestPhase2SilentFallback:
+    """Silent fallback fix (Phase 2.6)"""
+
+    def test_extractor_raises_on_broken_json(self):
+        import pytest as _pt
+        from src.knowledge.extractor import KnowledgeExtractor, ExtractionError
+        ex = KnowledgeExtractor()
+        with _pt.raises(ExtractionError):
+            ex._parse_extraction("not json at all", "PaperW")
+
+    def test_extractor_raises_on_array_root(self):
+        import pytest as _pt
+        from src.knowledge.extractor import KnowledgeExtractor, ExtractionError
+        ex = KnowledgeExtractor()
+        with _pt.raises(ExtractionError):
+            ex._parse_extraction("[1,2,3]", "PaperW")
+
+    def test_extractor_lenient_coerce_unknown_type(self):
+        from src.knowledge.extractor import KnowledgeExtractor
+        ex = KnowledgeExtractor()
+        raw = '{"nodes":[{"label":"Foo","node_type":"unknown_type"}],"edges":[]}'
+        res = ex._parse_extraction(raw, "PaperW")
+        assert res.had_parse_fallback is True
+        assert res.nodes[0].node_type.value == "other"
+        # Confidence 自动降权 (0.5 * 0.8 = 0.4)
+        assert abs(res.extraction_confidence - 0.4) < 1e-6
+
+
+class TestPhase2SemanticIndex:
+    """SemanticIndex (Phase 2.4)"""
+
+    def test_build_and_search(self):
+        from src.knowledge.semantic_index import SemanticIndex
+        from src.knowledge.graph_store import KnowledgeGraphStore
+        from src.knowledge.schema import KGNode, NodeType
+
+        store = KnowledgeGraphStore()
+        for label in ["ReAct", "Tool Use", "Long-term Memory", "Reflection"]:
+            store.add_node(KGNode(label=label, node_type=NodeType.METHOD if label == "ReAct" else NodeType.CONCEPT))
+
+        idx = SemanticIndex()
+        idx.build_from_store(store)
+        assert idx.size == 4
+        results = idx.search("react", top_k=2)
+        assert len(results) > 0
+        # ReAct 应该排第一
+        assert results[0]["label"] == "ReAct"

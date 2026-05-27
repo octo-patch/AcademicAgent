@@ -30,9 +30,22 @@ import logging
 from pathlib import Path
 from collections import Counter
 
+import os
+import tempfile
+
 import networkx as nx
 
-from .schema import KGNode, KGEdge, NodeType, RelationType
+from .schema import (
+    KGNode,
+    KGEdge,
+    NodeType,
+    RelationType,
+    DOMAIN_LLM,
+    DOMAIN_COMMS,
+    DOMAIN_SHARED,
+    KNOWN_DOMAINS,
+    normalize_domain,
+)
 
 logger = logging.getLogger("ScholarMind.GraphStore")
 
@@ -43,8 +56,8 @@ class KnowledgeGraphStore:
 
     Usage:
         store = KnowledgeGraphStore()
-        store.add_node(KGNode(label="OFDM", node_type=NodeType.CONCEPT))
-        store.add_node(KGNode(label="MIMO", node_type=NodeType.CONCEPT))
+        store.add_node(KGNode(label="ReAct", node_type=NodeType.CONCEPT))
+        store.add_node(KGNode(label="MemGPT", node_type=NodeType.CONCEPT))
         store.add_edge(KGEdge(
             source_id="concept_ofdm",
             target_id="concept_mimo",
@@ -57,22 +70,29 @@ class KnowledgeGraphStore:
     而 networkx 的 JSON 序列化会丢失自定义类。
     """
 
-    def __init__(self, graph_path: str | Path | None = None):
+    def __init__(
+        self,
+        graph_path: str | Path | None = None,
+        domain: str = DOMAIN_SHARED,
+    ):
         """
         初始化知识图谱存储
 
         Args:
             graph_path: JSON 持久化文件路径。如果文件存在则自动加载。
+            domain: 该 store 实例所属研究域（llm_agent/comms/shared）。
+                    新增节点未指定 domain 时继承此值；用于分图谱管理。
         """
         self._graph = nx.DiGraph()
         self._nodes: dict[str, KGNode] = {}  # node_id → KGNode
         self._edges: dict[str, KGEdge] = {}  # edge_id → KGEdge
         self._graph_path = Path(graph_path) if graph_path else None
+        self.domain = normalize_domain(domain)
 
         if self._graph_path and self._graph_path.exists():
             self.load(self._graph_path)
             logger.info(
-                f"加载知识图谱: {self.node_count} 节点, {self.edge_count} 边"
+                f"加载知识图谱 [{self.domain}]: {self.node_count} 节点, {self.edge_count} 边"
             )
 
     # ============================================================
@@ -86,12 +106,24 @@ class KnowledgeGraphStore:
         如果同 ID 节点已存在，合并其属性。
         返回节点 ID。
         """
+        # 新节点未指定 domain 时继承 store 的 domain
+        if not node.domain or node.domain == DOMAIN_SHARED:
+            if self.domain != DOMAIN_SHARED:
+                node.domain = self.domain
+
         node_id = node.node_id
 
         if node_id in self._nodes:
             # 已存在 → 合并属性
             existing = self._nodes[node_id]
             existing.merge_properties(node.properties)
+            # 跨域 merge：若 existing 是 shared 且 new 是具体域，升级到具体域
+            # 若两者都具体且不同，标记为 shared（跨域概念）
+            if existing.domain != node.domain:
+                if existing.domain == DOMAIN_SHARED:
+                    existing.domain = node.domain
+                elif node.domain != DOMAIN_SHARED:
+                    existing.domain = DOMAIN_SHARED
             # 更新 source_paper（追加来源）
             if node.source_paper and node.source_paper not in existing.properties.get(
                 "source_papers", []
@@ -118,11 +150,25 @@ class KnowledgeGraphStore:
 
     def add_edge(self, edge: KGEdge) -> str:
         """
-        添加边（自动去重）
+        添加边（证据累积 + 冲突标记，Phase 2.3）
 
-        如果同 ID 边已存在，更新置信度（取较高值）。
-        返回边 ID。
+        合并语义：
+          - 同 edge_id 已存在 → 把新 edge 的来源作为一条新 Evidence 追加，
+            confidence 重算为 max(local) + 0.05×(n_sources-1)，上限 1.0
+          - 同 source-target 但 relation_type 不兼容（如 improves vs supersedes）
+            → 两条 edge 都保留，互打 conflict=True + conflict_with 列表
+          - 全新 edge → 初始化 evidence list 为 [本次抽取]
+        返回 edge_id。
         """
+        from .evidence import (
+            Evidence,
+            accumulate_evidence,
+            compute_aggregate_confidence,
+            detect_conflict_for,
+            mark_conflict,
+            merge_evidence,
+        )
+
         edge_id = edge.edge_id
 
         # 确保源节点和目标节点存在
@@ -134,13 +180,37 @@ class KnowledgeGraphStore:
             return ""
 
         if edge_id in self._edges:
-            # 已存在 → 更新置信度
+            # 同 edge_id 已存在 → 累积证据 + 重算 confidence
             existing = self._edges[edge_id]
-            existing.confidence = max(existing.confidence, edge.confidence)
-            # 在真实的业务场景（如内容安全风控）中，我们需要引入 证据积累模型 或 多源冲突消解机制，而不是简单的取最大值
-            logger.debug(f"边去重: {edge_id}")
+            n_ev = merge_evidence(existing, edge)
+            existing.confidence = compute_aggregate_confidence(existing)
+            # 同步到 networkx
+            if self._graph.has_edge(existing.source_id, existing.target_id):
+                self._graph.edges[existing.source_id, existing.target_id]["confidence"] = existing.confidence
+            logger.debug(f"边证据累积: {edge_id} (now {n_ev} sources, conf={existing.confidence:.2f})")
         else:
-            # 新边
+            # 全新 edge：初始化 evidence list = [本次]
+            init_ev = Evidence(
+                source_paper=edge.source_paper or "(unknown)",
+                source_section=str(edge.properties.get("source_section", "")),
+                confidence=edge.confidence,
+                note=str(edge.properties.get("note", "")),
+            )
+            accumulate_evidence(edge, init_ev)
+
+            # 冲突检测：与现有 sibling edges 对比
+            conflict = detect_conflict_for(edge, self._edges)
+            if conflict:
+                mark_conflict(edge, conflict.edge_a_id)
+                # 把对端也打上标记
+                if conflict.edge_a_id in self._edges:
+                    mark_conflict(self._edges[conflict.edge_a_id], edge_id)
+                logger.warning(
+                    "edge 冲突: %s ⚔ %s (%s vs %s)",
+                    conflict.edge_a_id, conflict.edge_b_id,
+                    conflict.relation_a, conflict.relation_b,
+                )
+
             self._edges[edge_id] = edge
             self._graph.add_edge(
                 edge.source_id,
@@ -247,6 +317,23 @@ class KnowledgeGraphStore:
             if node.node_type == node_type
         ]
 
+    # ============================================================
+    # 证据 / 冲突查询 (Phase 2.3)
+    # ============================================================
+
+    def get_conflicting_edges(self) -> list[KGEdge]:
+        """返回所有被标记为 conflict=True 的边。"""
+        return [e for e in self._edges.values()
+                if e.properties.get("conflict") is True]
+
+    def get_evidence_for(self, edge_id: str) -> list[dict]:
+        """返回 edge 的证据列表（list[dict]，每项 {source_paper, confidence, ...}）。"""
+        edge = self._edges.get(edge_id)
+        if not edge:
+            return []
+        from .evidence import get_evidence_list
+        return get_evidence_list(edge)
+
     def search_nodes(self, keyword: str) -> list[KGNode]:
         """
         关键词搜索节点
@@ -290,12 +377,17 @@ class KnowledgeGraphStore:
 
     def save(self, path: str | Path | None = None) -> Path:
         """
-        保存知识图谱到 JSON 文件
+        保存知识图谱到 JSON 文件（**原子写**）。
 
-        【工程思考】为什么用 JSON 而不是 pickle/GraphML？
-        1. JSON 人类可读，方便调试和 Git diff
-        2. 跨语言兼容（未来可能有 JS 前端可视化）
-        3. 数据量小（<100 篇论文），性能不是问题
+        原子写流程：
+          1. 写入同目录下的 tempfile（避免跨磁盘 rename 失败）
+          2. fsync 保证落盘
+          3. os.replace() 原子 rename 到目标路径
+
+        【为什么改原子写】2026-05-20:
+          原实现 open(path, 'w') + dump 是非原子的——写入过程中崩溃/断电
+          会留下半截 JSON 文件，下次 load 直接报错且整个 KG 不可恢复。
+          这是 #9 工程隐患之一。
         """
         save_path = Path(path) if path else self._graph_path
         if not save_path:
@@ -307,17 +399,36 @@ class KnowledgeGraphStore:
             "metadata": {
                 "node_count": self.node_count,
                 "edge_count": self.edge_count,
-                "version": "1.0",
+                "domain": self.domain,
+                "version": "1.1",  # bump：新增 domain 字段
             },
             "nodes": [node.to_dict() for node in self._nodes.values()],
             "edges": [edge.to_dict() for edge in self._edges.values()],
         }
 
-        with open(save_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        # 原子写：tempfile 在同目录 -> fsync -> os.replace
+        # NamedTemporaryFile(delete=False) 是因为我们要手动 rename
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=f".{save_path.name}.",
+            suffix=".tmp",
+            dir=str(save_path.parent),
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, save_path)  # 原子 rename
+        except Exception:
+            # 失败时清理临时文件
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
 
         logger.info(
-            f"知识图谱已保存: {save_path} "
+            f"知识图谱已保存 [{self.domain}]: {save_path} "
             f"({self.node_count} 节点, {self.edge_count} 边)"
         )
         return save_path
@@ -336,19 +447,33 @@ class KnowledgeGraphStore:
         self._nodes.clear()
         self._edges.clear()
 
-        # 加载节点
+        # 加载节点 + 同步构造 old_id -> new_id 映射，处理 schema coerce 改变 node_id 的情况
+        # （例如旧 KG 中 channel_model_xxx 经 coerce 后变为 method_xxx，但 edge 仍指向旧 id）
+        id_remap: dict[str, str] = {}
         for node_data in data.get("nodes", []):
+            old_id = node_data.get("node_id", "")
             node = KGNode.from_dict(node_data)
+            if old_id and old_id != node.node_id:
+                id_remap[old_id] = node.node_id
             self._nodes[node.node_id] = node
             self._graph.add_node(
                 node.node_id,
                 label=node.label,
                 node_type=node.node_type.value,
             )
+        if id_remap:
+            logger.info("加载时检测到 %d 个 node_id 需要 coerce 重映射", len(id_remap))
 
-        # 加载边
+        # 加载边（应用 id 映射）
+        remapped_edges = 0
         for edge_data in data.get("edges", []):
             edge = KGEdge.from_dict(edge_data)
+            if edge.source_id in id_remap:
+                edge.source_id = id_remap[edge.source_id]
+                remapped_edges += 1
+            if edge.target_id in id_remap:
+                edge.target_id = id_remap[edge.target_id]
+                remapped_edges += 1
             self._edges[edge.edge_id] = edge
             if (
                 edge.source_id in self._graph
@@ -360,6 +485,8 @@ class KnowledgeGraphStore:
                     relation_type=edge.relation_type.value,
                     confidence=edge.confidence,
                 )
+        if remapped_edges:
+            logger.info("已重映射 %d 个 edge 端点", remapped_edges)
 
         logger.info(
             f"知识图谱已加载: {load_path} "
@@ -452,28 +579,65 @@ class KnowledgeGraphStore:
         )
 
     # ============================================================
-    # 语义检索（ReMe hybrid retrieval 思想）
+    # 语义检索 (Phase 2.4)
     # ============================================================
+
+    _semantic_index = None  # 类属性占位，实例 lazy 初始化
+
     def semantic_search(self, query: str, top_k: int = 5) -> list[dict]:
         """
-        基于 TF-IDF 的语义检索——零 API 调用、零 Token 消耗、零新依赖。
+        节点级语义检索。
 
-        【工程思考】为什么用 TF-IDF 而不是 Embedding？
-          - 在 <500 节点规模下，TF-IDF 与 Embedding 检索质量差距很小
-          - TF-IDF 纯本地计算，不需要外部 API 或 ChromaDB
-          - 框架灵感：ReMe 的 hybrid retrieval，兼顾精确度和成本
+        Phase 2.4 升级：优先用 src/knowledge/semantic_index.py 的 SemanticIndex
+        （sentence-transformers backend）；不可用时退化到本类自带的 TF-IDF 路径；
+        二者皆失败时再退化到 _keyword_fallback。
 
         Args:
             query: 搜索查询（支持中英文）
             top_k: 返回前 K 个最相关的节点
 
         Returns:
-            排序后的节点字典列表，包含 similarity 分数
+            list[dict]: [{node_id, label, type, similarity, source_paper, first_seen_year}, ...]
         """
         nodes = list(self._nodes.values())
         if not nodes:
             return []
 
+        # ---- 优先：SemanticIndex（embedding 或 TF-IDF, 都比 inline path 好用）----
+        try:
+            from .semantic_index import SemanticIndex
+            if self._semantic_index is None or self._semantic_index.size != len(nodes):
+                self._semantic_index = SemanticIndex(domain=self.domain)
+                # 尝试加载 cache；失败/无效则现场构建
+                if not self._semantic_index.load_cache() or self._semantic_index.size != len(nodes):
+                    self._semantic_index.build_from_store(self)
+                    try:
+                        self._semantic_index.save_cache()
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug("semantic cache save skipped: %s", exc)
+            hits = self._semantic_index.search(query, top_k=top_k, min_similarity=0.0)
+            # 补充节点元数据
+            enriched = []
+            for h in hits:
+                node = self._nodes.get(h["node_id"])
+                if node is None:
+                    continue
+                enriched.append({
+                    "node_id": node.node_id,
+                    "label": node.label,
+                    "type": node.node_type.value,
+                    "similarity": h["similarity"],
+                    "source_paper": node.source_paper,
+                    "first_seen_year": node.first_seen_year,
+                })
+            if enriched:
+                return enriched
+        except ImportError as exc:
+            logger.debug("SemanticIndex 不可用 (%s)，走内置 TF-IDF", exc)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("SemanticIndex 失败 (%s)，回退到内置 TF-IDF", exc)
+
+        # ---- 内置 TF-IDF fallback ----
         try:
             from sklearn.feature_extraction.text import TfidfVectorizer
             from sklearn.metrics.pairwise import cosine_similarity
@@ -613,400 +777,11 @@ class KnowledgeGraphStore:
         return stats
 
     # ============================================================
-    # 交互式可视化（pyvis）
+    # 交互式可视化 —— 已迁移到 src/knowledge/visualizer.py
+    # 此处保留 thin shim 保持调用方零修改
     # ============================================================
 
     def visualize(self, output_path: str = "data/kg_visualization.html") -> str:
-        """
-        生成交互式知识图谱 HTML（pyvis 力导向图 + 图例 + 说明 + 筛选）
-
-        在浏览器中打开生成的 HTML 即可交互：
-        - 拖拽节点 / 缩放画布
-        - 悬停查看详情（类型、年份、录入时间）
-        - 通过图例按类型筛选节点
-
-        Args:
-            output_path: HTML 输出路径
-
-        Returns:
-            输出文件的绝对路径
-        """
-        try:
-            from pyvis.network import Network
-        except ImportError:
-            logger.error("pyvis 未安装。请运行: pip install pyvis")
-            return ""
-
-        if self.node_count == 0:
-            logger.warning("知识图谱为空，无法生成可视化")
-            return ""
-
-        net = Network(
-            height="650px",
-            width="100%",
-            directed=True,
-            notebook=False,
-            bgcolor="#f8fafc",
-            font_color="#1e293b",
-        )
-
-        # 节点颜色映射（按类型区分，明亮风格）
-        color_map = {
-            "paper":   "#2563eb",  # 蓝色 — 论文
-            "concept": "#dc2626",  # 红色 — 概念
-            "method":  "#0891b2",  # 青色 — 方法
-            "author":  "#6b7280",  # 灰色 — 作者
-            "metric":  "#d97706",  # 琥珀 — 指标
-            "dataset": "#7c3aed",  # 紫色 — 数据集
-            "tool":    "#059669",  # 绿色 — 工具
-        }
-
-        type_labels = {
-            "paper": "📄 论文", "concept": "💡 概念", "method": "⚙️ 方法",
-            "author": "👤 作者", "metric": "📏 指标", "dataset": "📊 数据集",
-            "tool": "🔧 工具",
-        }
-
-        # 统计各类型数量
-        type_counts: dict[str, int] = {}
-        for node in self._nodes.values():
-            t = node.node_type.value
-            type_counts[t] = type_counts.get(t, 0) + 1
-
-        # 构建每个类型的节点列表（供图例下拉用）
-        import json as _json
-        type_node_lists: dict[str, list[dict]] = {}
-        for t in type_labels:
-            type_node_lists[t] = []
-
-        # 添加节点
-        for node_id, node in self._nodes.items():
-            node_type_str = node.node_type.value
-            color = color_map.get(node_type_str, "#94a3b8")
-
-            degree = self._graph.degree(node_id) if node_id in self._graph else 1
-
-            # 构建 tooltip 数据（用 JSON 存储，由自定义 JS 解析渲染）
-            tooltip_data = {
-                "name": node.label,
-                "type": type_labels.get(node_type_str, node_type_str),
-                "color": color,
-            }
-            if node.first_seen_year:
-                tooltip_data["year"] = node.first_seen_year
-            if node.created_at:
-                tooltip_data["added"] = node.created_at[:10]
-            if node.source_paper:
-                tooltip_data["source"] = node.source_paper[:60]
-            for key in ("description", "definition", "category"):
-                val = node.properties.get(key)
-                if val and isinstance(val, str):
-                    tooltip_data["desc"] = val[:100] + ("..." if len(val) > 100 else "")
-                    break
-            tooltip_data["degree"] = degree
-            tooltip_data["ntype"] = node_type_str
-
-            # 将 JSON 存入 title（自定义 JS 会解析它）
-            title_json = _json.dumps(tooltip_data, ensure_ascii=False)
-
-            # 节点大小
-            size = max(12, min(55, 8 + degree * 4))
-            if node_type_str == "author":
-                size = max(10, min(20, 8 + degree * 2))
-
-            # 字号按度数缩放：度越高字越大
-            short_label = node.label if len(node.label) <= 22 else node.label[:19] + "..."
-            font_size = max(12, min(30, 10 + degree * 2))
-
-            net.add_node(
-                node_id,
-                label=short_label,
-                color=color,
-                title=title_json,
-                size=size,
-                font={"size": font_size,
-                      "color": "#1e293b",
-                      "strokeWidth": 3,
-                      "strokeColor": "#ffffff"},
-                borderWidth=2,
-                borderWidthSelected=4,
-            )
-
-            # 收集到类型列表
-            if node_type_str in type_node_lists:
-                type_node_lists[node_type_str].append({
-                    "id": node_id,
-                    "label": node.label,
-                    "degree": degree,
-                })
-
-        # 按度数排序每个类型的列表
-        for t in type_node_lists:
-            type_node_lists[t].sort(key=lambda x: x["degree"], reverse=True)
-
-        # 添加边
-        for edge in self._edges.values():
-            if edge.source_id in self._nodes and edge.target_id in self._nodes:
-                rel_label = edge.relation_type.value.replace("_", " ")
-                net.add_edge(
-                    edge.source_id,
-                    edge.target_id,
-                    title=rel_label,
-                    label="",
-                    color="#94a3b888",
-                    arrows="to",
-                    width=1.5,
-                )
-
-        # 物理引擎配置
-        net.set_options("""
-        {
-            "physics": {
-                "forceAtlas2Based": {
-                    "gravitationalConstant": -80,
-                    "centralGravity": 0.008,
-                    "springLength": 160,
-                    "springConstant": 0.04,
-                    "avoidOverlap": 0.8
-                },
-                "solver": "forceAtlas2Based",
-                "stabilization": {"iterations": 200}
-            },
-            "edges": {
-                "smooth": {"type": "continuous"},
-                "font": {"size": 0}
-            },
-            "interaction": {
-                "hover": true,
-                "tooltipDelay": 9999999,
-                "zoomView": true,
-                "dragView": true
-            },
-            "nodes": {
-                "shape": "dot",
-                "font": {"face": "Segoe UI, Microsoft YaHei, sans-serif"}
-            }
-        }
-        """)
-
-        # 生成 pyvis 的原始 HTML
-        output = Path(output_path)
-        output.parent.mkdir(parents=True, exist_ok=True)
-        net.save_graph(str(output))
-
-        # 读取并注入自定义包装
-        raw_html = output.read_text(encoding="utf-8")
-
-        # --- 构建图例 HTML（含下拉列表）---
-        legend_items = ""
-        for t, label in type_labels.items():
-            c = color_map.get(t, "#94a3b8")
-            count = type_counts.get(t, 0)
-            if count <= 0:
-                continue
-            nodes_in_type = type_node_lists.get(t, [])
-            dropdown_items = "".join(
-                f'<div class="dropdown-node" data-node-id="{n["id"]}">'
-                f'{n["label"]} <span class="dd-degree">度={n["degree"]}</span></div>'
-                for n in nodes_in_type
-            )
-            legend_items += (
-                f'<div class="legend-group" data-type="{t}">'
-                f'<label class="legend-item">'
-                f'<input type="checkbox" class="type-toggle" data-type="{t}" checked '
-                f'style="margin:0 2px 0 0;cursor:pointer;">'
-                f'<span class="legend-dot" style="background:{c}"></span>'
-                f'{label} ({count})</label>'
-                f'<div class="legend-dropdown">{dropdown_items}</div>'
-                f'</div>'
-            )
-
-        # 年份分布
-        years = {}
-        for n in self._nodes.values():
-            if n.first_seen_year:
-                y = str(n.first_seen_year)
-                years[y] = years.get(y, 0) + 1
-        year_info = " · ".join(f"{y}年: {c}个" for y, c in sorted(years.items()))
-
-        # JSON for JS interaction
-        type_nodes_json = _json.dumps(type_node_lists, ensure_ascii=False)
-
-        custom_css = """
-        <style>
-          body { margin: 0; font-family: 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif; background: #f5f7fb; }
-          .kg-header { background: linear-gradient(135deg, #2563eb, #0891b2); color: white; padding: 1.2rem 2rem; box-shadow: 0 2px 8px rgba(0,0,0,0.15); }
-          .kg-header h1 { font-size: 1.3rem; margin: 0 0 0.3rem; }
-          .kg-header .meta { opacity: 0.85; font-size: 0.85rem; }
-          .kg-header .nav-back { color: white; text-decoration: none; font-size: 0.85rem; opacity: 0.8; }
-          .kg-header .nav-back:hover { opacity: 1; text-decoration: underline; }
-          .kg-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 0.3rem; background: white; padding: 0.6rem 2rem; border-bottom: 1px solid #e2e8f0; font-size: 0.85rem; }
-          .legend-group { position: relative; display: inline-block; }
-          .legend-item { display: inline-flex; align-items: center; gap: 4px; padding: 4px 10px; border-radius: 6px; color: #374151; cursor: pointer; transition: background 0.15s; }
-          .legend-item:hover { background: #f0f4f8; }
-          .legend-dot { width: 12px; height: 12px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
-          .legend-dropdown { display: none; position: absolute; top: 100%; left: 0; z-index: 999; background: white; border: 1px solid #e2e8f0; border-radius: 10px; box-shadow: 0 8px 30px rgba(0,0,0,0.12); min-width: 240px; max-height: 280px; overflow-y: auto; padding: 6px 0; }
-          .legend-group:hover .legend-dropdown { display: block; }
-          .dropdown-node { padding: 6px 14px; cursor: pointer; font-size: 0.82rem; transition: background 0.1s; display: flex; justify-content: space-between; align-items: center; }
-          .dropdown-node:hover { background: #eff6ff; color: #2563eb; }
-          .dd-degree { font-size: 0.7rem; color: #94a3b8; }
-          .kg-tip { background: #fffbeb; border-top: 1px solid #fde68a; padding: 0.5rem 2rem; font-size: 0.78rem; color: #92400e; }
-          .kg-footer { text-align: center; padding: 0.6rem; font-size: 0.72rem; color: #94a3b8; border-top: 1px solid #e2e8f0; background: white; }
-          #mynetwork { border: none !important; }
-          /* 自定义 tooltip 浮层 */
-          #kg-tooltip {
-            display: none; position: fixed; z-index: 10000;
-            background: white; border: 1px solid #e2e8f0; border-radius: 12px;
-            box-shadow: 0 8px 30px rgba(0,0,0,0.12); padding: 14px 18px;
-            min-width: 220px; max-width: 340px; pointer-events: none;
-            font-size: 0.85rem; line-height: 1.6;
-          }
-          #kg-tooltip .tt-name { font-size: 1.05rem; font-weight: 700; margin-bottom: 6px; }
-          #kg-tooltip .tt-type { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 0.75rem; font-weight: 600; margin-bottom: 8px; }
-          #kg-tooltip .tt-row { display: flex; align-items: center; gap: 6px; color: #475569; font-size: 0.82rem; margin: 3px 0; }
-          #kg-tooltip .tt-row .tt-icon { width: 16px; text-align: center; flex-shrink: 0; }
-          #kg-tooltip .tt-desc { margin-top: 8px; padding-top: 8px; border-top: 1px solid #f1f5f9; color: #64748b; font-size: 0.8rem; }
-          #kg-tooltip .tt-bar { height: 3px; border-radius: 2px; margin-top: 8px; }
-        </style>
-        """
-
-        header_html = f"""
-        {custom_css}
-        <div class="kg-header">
-          <a class="nav-back" href="dashboard.html">← 返回 Dashboard</a>
-          <h1>🕸️ 知识图谱交互式可视化</h1>
-          <div class="meta">{self.node_count} 个节点 · {self.edge_count} 条关系 · {len(type_counts)} 种类型 · 全连通</div>
-        </div>
-        <div class="kg-bar">
-          <span style="font-weight:600;color:#2563eb;margin-right:4px;">图例：</span>
-          {legend_items}
-          <span style="margin-left:auto;color:#6b7280;font-size:0.78rem;">年份: {year_info}</span>
-        </div>
-        <div class="kg-tip">
-          💡 <b>操作提示</b>：滚轮缩放 · 拖拽画布 · 拖拽节点 · 悬停节点查看详情 · 悬停图例展开列表 · 点击列表项定位高亮
-          <span style="margin-left:auto;display:inline-flex;align-items:center;gap:6px;">
-            🔤 字号：<input type="range" id="fontSlider" min="6" max="40" value="22" style="width:100px;cursor:pointer;"><span id="fontVal" style="min-width:28px">22</span>
-          </span>
-        </div>
-        <div id="kg-tooltip"></div>
-        """
-
-        footer_html = f"""
-        <div class="kg-footer">
-          ScholarMind 知识图谱 · {self.node_count} nodes / {self.edge_count} edges · 节点大小=连接度 · 度≥4 显示标签
-        </div>
-        """
-
-        # 自定义 JS：tooltip 浮层 + 图例交互
-        custom_js = f"""
-        <script>
-        (function() {{
-          var tooltip = document.getElementById('kg-tooltip');
-          var net = network;  // pyvis 暴露的全局变量
-
-          // --- 1. 自定义 Tooltip ---
-          net.on('hoverNode', function(params) {{
-            var nodeId = params.node;
-            var nodeData = net.body.data.nodes.get(nodeId);
-            if (!nodeData || !nodeData.title) return;
-            try {{
-              var d = JSON.parse(nodeData.title);
-              var html = '<div class="tt-name" style="color:' + (d.color||'#333') + '">' + d.name + '</div>';
-              html += '<span class="tt-type" style="background:' + (d.color||'#333') + '22;color:' + (d.color||'#333') + '">' + (d.type||'') + '</span>';
-              if (d.year) html += '<div class="tt-row"><span class="tt-icon">📅</span> 首次出现: ' + d.year + ' 年</div>';
-              if (d.added) html += '<div class="tt-row"><span class="tt-icon">🕐</span> 录入时间: ' + d.added + '</div>';
-              if (d.source) html += '<div class="tt-row"><span class="tt-icon">📎</span> 来源: ' + d.source + '</div>';
-              html += '<div class="tt-row"><span class="tt-icon">🔗</span> 连接数: ' + (d.degree||0) + '</div>';
-              if (d.desc) html += '<div class="tt-desc">📝 ' + d.desc + '</div>';
-              html += '<div class="tt-bar" style="background:' + (d.color||'#333') + '"></div>';
-              tooltip.innerHTML = html;
-              tooltip.style.display = 'block';
-            }} catch(e) {{}}
-          }});
-
-          net.on('blurNode', function() {{
-            tooltip.style.display = 'none';
-          }});
-
-          // 鼠标移动时更新 tooltip 位置
-          document.getElementById('mynetwork').addEventListener('mousemove', function(e) {{
-            if (tooltip.style.display === 'block') {{
-              var x = e.clientX + 15;
-              var y = e.clientY + 15;
-              if (x + 350 > window.innerWidth) x = e.clientX - 260;
-              if (y + 200 > window.innerHeight) y = e.clientY - 180;
-              tooltip.style.left = x + 'px';
-              tooltip.style.top = y + 'px';
-            }}
-          }});
-
-          // --- 2. 图例下拉：点击节点项 → 高亮并聚焦 ---
-          document.querySelectorAll('.dropdown-node').forEach(function(el) {{
-            el.addEventListener('click', function(e) {{
-              e.stopPropagation();
-              var nodeId = this.getAttribute('data-node-id');
-              net.selectNodes([nodeId]);
-              net.focus(nodeId, {{
-                scale: 1.5,
-                animation: {{duration: 600, easingFunction: 'easeInOutQuad'}}
-              }});
-            }});
-          }});
-
-          // --- 3. 字号滑块 ---
-          var slider = document.getElementById('fontSlider');
-          var fontVal = document.getElementById('fontVal');
-          // 记录每个节点的原始字号和类型
-          var origFonts = {{}};
-          var nodeTypes = {{}};
-          var hiddenTypes = {{}};
-          net.body.data.nodes.forEach(function(node) {{
-            origFonts[node.id] = (node.font && node.font.size) || 14;
-            try {{ nodeTypes[node.id] = JSON.parse(node.title).ntype || ''; }} catch(e) {{ nodeTypes[node.id] = ''; }}
-          }});
-
-          if (slider) {{
-            slider.addEventListener('input', function() {{
-              var scale = parseInt(this.value) / 22.0;  // 22 是基准
-              fontVal.textContent = parseInt(this.value);
-              var allNodes = net.body.data.nodes;
-              var updates = [];
-              allNodes.forEach(function(node) {{
-                var hidden = hiddenTypes[nodeTypes[node.id]];
-                var newSize = hidden ? 0 : Math.round(origFonts[node.id] * scale);
-                updates.push({{id: node.id, font: {{size: newSize}}}});
-              }});
-              allNodes.update(updates);
-            }});
-          }}
-
-          // --- 4. Checkbox 切换类型标签显示/隐藏 ---
-          document.querySelectorAll('.type-toggle').forEach(function(cb) {{
-            cb.addEventListener('change', function() {{
-              var type = this.getAttribute('data-type');
-              var show = this.checked;
-              hiddenTypes[type] = !show;
-              var scale = slider ? parseInt(slider.value) / 22.0 : 1.0;
-              var allNodes = net.body.data.nodes;
-              var updates = [];
-              allNodes.forEach(function(node) {{
-                if (nodeTypes[node.id] === type) {{
-                  var newSize = show ? Math.round(origFonts[node.id] * scale) : 0;
-                  updates.push({{id: node.id, font: {{size: newSize}}}});
-                }}
-              }});
-              allNodes.update(updates);
-            }});
-          }});
-        }})();
-        </script>
-        """
-
-        # 注入到 pyvis 生成的 HTML 中
-        enhanced = raw_html.replace("<body>", f"<body>\n{header_html}\n", 1)
-        enhanced = enhanced.replace("</body>", f"\n{footer_html}\n{custom_js}\n</body>", 1)
-
-        output.write_text(enhanced, encoding="utf-8")
-        logger.info(f"知识图谱可视化已保存: {output} ({self.node_count} 节点, {self.edge_count} 边)")
-        return str(output.resolve())
-
+        """生成交互式 HTML 可视化（委托给 visualizer.visualize）。"""
+        from .visualizer import visualize
+        return visualize(self, output_path=output_path)

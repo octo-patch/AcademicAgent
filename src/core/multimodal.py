@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 ScholarMind - 多模态图表分析模块
 ================================
@@ -22,16 +24,18 @@ ScholarMind - 多模态图表分析模块
   - 学术图表种类多样（框图、流程图、信号流图、曲线对比…），
     单一 CV 模型覆盖不了
   - Vision LLM 可以同时理解"图"和"上下文文字"
-  - 对于通信感知领域，LLM 能理解 OFDM 框图/BER 曲线的含义，
+  - 对于大模型 Agent 论文，LLM 能理解架构图、流程图、消融表和 benchmark 曲线，
     而通用 OCR 只能提取文字
 """
 
+import hashlib
 import json
 import logging
 import os
-from enum import Enum
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
+from string import Template
 
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -99,7 +103,7 @@ PROMPTS_DIR = Path(__file__).parent.parent.parent / "prompts" / "domain_prompts"
 # 内联 fallback（当 prompt 文件不存在时使用）
 _FALLBACK_PROMPTS = {
     "figure_type_detection": (
-        'You are analyzing a figure from an academic paper in communications/sensing.\n'
+        'You are analyzing a figure from an academic paper in the large language model Agent domain.\n'
         'Identify the type: block_diagram, signal_flow, performance_curve, table, equation, photo, or other.\n'
         'Respond in JSON: {"figure_type": "<type>", "description": "<one-sentence>"}'
     ),
@@ -163,11 +167,21 @@ class FigureAnalyzer:
         self,
         model: str | None = None,
         max_tokens: int = 2000,
+        enable_cache: bool = True,
     ):
-        self.model = model or os.getenv("MINIMAX_MODEL", "MiniMax-Text-01")
+        # Phase 3.2: 独立 vision 模型 env (MINIMAX_VISION_MODEL)
+        # 防止 MINIMAX_MODEL 切到 reasoning 模型时图表分析静默变瞎。
+        # 默认 MiniMax-Text-01（可换 abab6.5s-chat）。
+        self.model = (
+            model
+            or os.getenv("MINIMAX_VISION_MODEL")
+            or "MiniMax-Text-01"
+        )
         self.max_tokens = max_tokens
         # 延迟加载 API key，避免导入时就报错
         self._client = None
+        # Phase 3.2: Vision API 结果缓存（(base64_hash, prompt_hash) -> result）
+        self._cache: dict[tuple, str] = {} if enable_cache else None  # type: ignore
 
     @property
     def client(self) -> OpenAI:
@@ -210,7 +224,11 @@ class FigureAnalyzer:
         prompts = _get_prompts()
         prompt_key = FIGURE_TYPE_TO_PROMPT_KEY.get(figure_type, "general")
         prompt_template = prompts.get(prompt_key, prompts["general"])
-        prompt = prompt_template.format(context=context or "（无额外上下文）")
+        # Phase 3.2: 用 simple string replace 替代 .format()，避免 prompt 中其他 { 触发 KeyError
+        # （JSON 示例里的 {...} 会被 .format 当 placeholder 解析）
+        prompt = prompt_template.replace(
+            "{context}", context or "（无额外上下文）",
+        )
 
         # Step 3: 调用 Vision API
         raw_result = await self._call_vision(image_base64, prompt, media_type)
@@ -250,7 +268,21 @@ class FigureAnalyzer:
 
         使用 OpenAI SDK 的 image_url 格式传递 base64 图片：
         data:<media_type>;base64,<data>
+
+        Phase 3.2: 同进程缓存 (base64_hash, prompt_hash) -> raw 响应。
+        典型场景：同一图在 type detection + detail analyze 两阶段都被调用，
+        缓存避免重复花钱。
         """
+        # Cache lookup
+        cache_key = None
+        if self._cache is not None:
+            img_hash = hashlib.md5(image_base64[:512].encode("utf-8")).hexdigest()[:12]
+            prompt_hash = hashlib.md5(prompt.encode("utf-8")).hexdigest()[:12]
+            cache_key = (self.model, img_hash, prompt_hash)
+            if cache_key in self._cache:
+                logger.info("vision cache hit: %s", cache_key)
+                return self._cache[cache_key]
+
         data_uri = f"data:{media_type};base64,{image_base64}"
 
         response = self.client.chat.completions.create(
@@ -274,8 +306,14 @@ class FigureAnalyzer:
                 }
             ],
         )
+        from src.core.llm_logging import log_model_once
+        log_model_once("multimodal.vision", self.model, response)
 
-        return response.choices[0].message.content
+        raw = response.choices[0].message.content or ""
+        # Cache write
+        if cache_key is not None and self._cache is not None:
+            self._cache[cache_key] = raw
+        return raw
 
     def _extract_json(self, text: str) -> dict:
         """
@@ -357,35 +395,49 @@ class PaperStructureParser:
     """
 
     # 【踩坑记录】IEEE 论文用罗马数字编号（I. Introduction），
-    # 而 arXiv/Springer 用阿拉伯数字（1. Introduction）
-    # 正则需要同时覆盖两种格式
+    # 而 arXiv/Springer 用阿拉伯数字（1. Introduction）；
+    # NeurIPS/ACL/AAAI 投稿稿件常常被 PDF 转换成 markdown 化的 `# Section` 风格；
+    # 中文论文用「摘要 / 引言 / 方法」等。
+    # 正则需要同时覆盖五种格式（Phase 3.4 扩展）。
     #
     # 【踩坑记录 #2】"Algorithm content." 这类内容行也会匹配 "algorithm\b"
     # → 解法：对于模糊关键词（algorithm, conclusion, result…）
     #   要求必须有数字/罗马前缀，或者行内单词数 ≤ 4
-    _NUM_PREFIX_OPT = r"(?:(?:\d+|[IVX]+)\.?\s*)?"   # 可选前缀
+    _NUM_PREFIX_OPT = r"(?:(?:\d+|[IVX]+)\.?\s*)?"   # 可选前缀: "1." / "I." / 空
     _NUM_PREFIX_REQ = r"(?:(?:\d+|[IVX]+)\.?\s+)"     # 必须有前缀
+    _MD_PREFIX_OPT = r"(?:#+\s*)?"                    # NeurIPS markdown: "## " / "# 1 "
+    _MD_NUM_PREFIX = rf"(?:#+\s*)?{_NUM_PREFIX_OPT}"  # markdown + 可选编号
 
     # 匹配策略：
     # - abstract / references: 通常独占一行，精确匹配
     # - introduction 等复合词: 不太会出现在正文首词，前缀可选
     # - algorithm / conclusion 等单词: 容易在正文出现，需要前缀或精确匹配
+    # - 中文章节: 独占一行，无需前缀
     SECTION_PATTERNS = [
-        (r"(?i)^abstract\s*$", "abstract"),
-        (rf"(?i)^{_NUM_PREFIX_OPT}introduction\s*$", "introduction"),
-        (rf"(?i)^{_NUM_PREFIX_OPT}(?:related\s+work|background|literature\s+review)\b", "related_work"),
-        (rf"(?i)^{_NUM_PREFIX_OPT}(?:system\s+model|problem\s+formulation)\b", "system_model"),
-        # method: 复合短语（proposed method/algorithm）前缀可选，
-        # 但单独的 "algorithm" / "methodology" 需要前缀
-        (rf"(?i)^{_NUM_PREFIX_OPT}proposed\s+(?:method|algorithm|scheme|framework)\s*$", "method"),
-        (rf"(?i)^{_NUM_PREFIX_REQ}(?:methodology|approach|algorithm)\b", "method"),
-        # experiments: 复合短语前缀可选，单词需要前缀
-        (rf"(?i)^{_NUM_PREFIX_OPT}(?:simulations?\s+results?|numerical\s+results?)\b", "experiments"),
-        (rf"(?i)^{_NUM_PREFIX_REQ}(?:experiments?|results?|evaluation)\b", "experiments"),
-        # conclusion: 需要前缀或精确匹配
-        (rf"(?i)^{_NUM_PREFIX_OPT}conclusions?\s*$", "conclusion"),
-        (rf"(?i)^{_NUM_PREFIX_REQ}(?:summary|concluding)\b", "conclusion"),
-        (r"(?i)^(?:references|bibliography)\s*$", "references"),
+        # ---- 英文（IEEE / arXiv / NeurIPS markdown） ----
+        (rf"(?i)^{_MD_PREFIX_OPT}abstract\s*$", "abstract"),
+        (rf"(?i)^{_MD_NUM_PREFIX}introduction\s*$", "introduction"),
+        (rf"(?i)^{_MD_NUM_PREFIX}(?:related\s+work|background|literature\s+review)\b", "related_work"),
+        (rf"(?i)^{_MD_NUM_PREFIX}(?:system\s+model|problem\s+formulation|preliminaries)\b", "system_model"),
+        (rf"(?i)^{_MD_NUM_PREFIX}proposed\s+(?:method|algorithm|scheme|framework)\s*$", "method"),
+        (rf"(?i)^(?:#+\s*)?{_NUM_PREFIX_REQ}(?:methodology|approach|algorithm)\b", "method"),
+        (rf"(?i)^{_MD_NUM_PREFIX}(?:our\s+(?:method|approach)|method\b)\s*$", "method"),
+        (rf"(?i)^{_MD_NUM_PREFIX}(?:simulations?\s+results?|numerical\s+results?|empirical\s+evaluation)\b", "experiments"),
+        (rf"(?i)^(?:#+\s*)?{_NUM_PREFIX_REQ}(?:experiments?|results?|evaluation)\b", "experiments"),
+        (rf"(?i)^{_MD_NUM_PREFIX}conclusions?\s*$", "conclusion"),
+        (rf"(?i)^(?:#+\s*)?{_NUM_PREFIX_REQ}(?:summary|concluding)\b", "conclusion"),
+        (rf"(?i)^{_MD_PREFIX_OPT}(?:references|bibliography)\s*$", "references"),
+        # ---- 中文章节 (Phase 3.4) ----
+        # 允许可选数字前缀（"1. 引言" / "1 引言" / "引言"）
+        (r"^\s*(?:\d+[\.\s]*)?摘\s*要\s*$", "abstract"),
+        (r"^\s*(?:\d+[\.\s]*)?引\s*言\s*$", "introduction"),
+        (r"^\s*(?:\d+[\.\s]*)?绪\s*论\s*$", "introduction"),
+        (r"^\s*(?:\d+[\.\s]*)?(?:研究背景|相关工作|文献综述)\s*$", "related_work"),
+        (r"^\s*(?:\d+[\.\s]*)?(?:系统模型|问题描述|预备知识)\s*$", "system_model"),
+        (r"^\s*(?:\d+[\.\s]*)?(?:方\s*法|方法论|本文方法|提出方法|算法设计)\s*$", "method"),
+        (r"^\s*(?:\d+[\.\s]*)?(?:实\s*验|实验结果|仿真结果|数值实验)\s*$", "experiments"),
+        (r"^\s*(?:\d+[\.\s]*)?(?:结\s*论|总\s*结|结束语)\s*$", "conclusion"),
+        (r"^\s*(?:\d+[\.\s]*)?参考文献\s*$", "references"),
     ]
 
     def parse_sections(self, full_text: str) -> dict[str, str]:

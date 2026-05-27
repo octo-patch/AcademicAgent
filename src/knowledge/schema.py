@@ -4,18 +4,18 @@ from __future__ import annotations
 ScholarMind - 知识图谱 Schema 定义
 ====================================
 
-定义通信感知（ISAC/6G）领域的知识图谱结构：
+定义大模型 Agent 领域的知识图谱结构：
   - 节点类型（Paper, Author, Concept, Method, Dataset, Metric, Tool）
   - 关系类型（PROPOSES, USES, IMPROVES, COMPARES_WITH, ...）
   - 数据类（KGNode, KGEdge, ExtractionResult）
 
 设计原则：
   1. Schema-first: 先定义 Schema，再用 Schema 引导 LLM 抽取
-  2. 领域定制: 节点/关系类型针对通信感知领域优化
+  2. 领域定制: 节点/关系类型针对 Agent 论文中的方法、架构、数据集、指标和系统优化
   3. 可扩展: 新增类型只需在枚举中追加，不改动存储/抽取逻辑
 
 【工程思考】为什么要有 Schema？
-  - 无 Schema 的自由抽取会导致同义词泛滥（如 "OFDM", "ofdm", "正交频分复用"）
+  - 无 Schema 的自由抽取会导致同义词泛滥（如 "ReAct", "react", "Reasoning and Acting"）
   - Schema 约束让 LLM 输出规范化，便于去重和图谱合并
   - Schema 也是知识图谱可视化和查询的基础
 """
@@ -25,7 +25,7 @@ import hashlib
 from datetime import datetime, timezone
 from enum import Enum
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Dict, Literal, Optional, Union
 
 from pydantic import BaseModel, Field
 
@@ -34,7 +34,16 @@ from pydantic import BaseModel, Field
 # 节点类型枚举
 # ============================================================
 class NodeType(str, Enum):
-    """知识图谱中的节点类型"""
+    """知识图谱中的节点类型
+
+    扩展原则（2026-05-20）：
+      - 原 7 类（paper/author/concept/method/dataset/metric/tool）保持
+      - 新增 4 类（framework/benchmark/hardware_platform/system）覆盖
+        LLM Agent + 通信/SLAM/ISAC 两个域共同需要的概念
+      - 新增 OTHER 作为容错兜底（旧数据中未注册类型落入此类，避免静默丢失）
+      - 别名映射（NODE_TYPE_ALIASES）把 v1/v2/v3 时期的领域专用类型
+        归并到通用类型，保证旧 KG 加载零数据丢失
+    """
 
     PAPER = "paper"
     """论文：知识图谱的核心节点"""
@@ -43,19 +52,52 @@ class NodeType(str, Enum):
     """作者：论文的创作者"""
 
     CONCEPT = "concept"
-    """概念：领域术语/技术概念（如 OFDM, MIMO, RIS, ISAC）"""
+    """概念：领域术语/技术概念（如 Planning, Tool Use, Long-term Memory, RAG, mmWave）"""
 
     METHOD = "method"
-    """方法/算法：论文提出或使用的具体方法"""
+    """方法/算法：论文提出或使用的具体方法（如 ReAct, EKF, Belief Propagation）"""
 
     DATASET = "dataset"
     """数据集：实验使用的数据集"""
 
     METRIC = "metric"
-    """评估指标：如 BER, RMSE, CRLB, Throughput"""
+    """评估指标：如 Accuracy, BER, RMSE, CRLB, Throughput"""
 
     TOOL = "tool"
-    """工具/框架：如 MATLAB, Python, ns-3, TensorFlow"""
+    """工具：如 MATLAB, Python, ns-3, PyTorch（区别于 FRAMEWORK：tool 是开发/运行环境）"""
+
+    FRAMEWORK = "framework"
+    """框架/系统级方法：如 LangGraph, AutoGen, ROS, MQTT（区别于 method：framework 是可组合的子系统）"""
+
+    BENCHMARK = "benchmark"
+    """评测集/基准：如 MMLU, AgentBench, GAIA, KITTI"""
+
+    HARDWARE_PLATFORM = "hardware_platform"
+    """硬件平台：如 NVIDIA H100, RHS, Phased Array, mmWave Testbed"""
+
+    SYSTEM = "system"
+    """端到端系统/产品：如 ChatGPT, AutoGPT, 5G NR PHY"""
+
+    OTHER = "other"
+    """兜底类型：旧数据/异常输入回退到此，避免 ValueError"""
+
+
+# 把已知的领域专用 type → 通用 NodeType。
+# 历史包袱：v1/v2/v3 通信入图阶段引入了一批通信专用类型，现需要
+# 在加载旧 KG 时无损映射到通用类型。
+NODE_TYPE_ALIASES: dict[str, NodeType] = {
+    # ---- 通信/SLAM/ISAC 时期专用类型 ----
+    "performance_metric": NodeType.METRIC,
+    "estimation_method": NodeType.METHOD,
+    "channel_model": NodeType.METHOD,     # 信道模型是数学模型，归 method
+    "localization_algorithm": NodeType.METHOD,
+    "sensing_modality": NodeType.CONCEPT,
+    # ---- 其他常见同义/拼写 ----
+    "algorithm": NodeType.METHOD,
+    "model": NodeType.METHOD,
+    "module": NodeType.FRAMEWORK,
+    "platform": NodeType.HARDWARE_PLATFORM,
+}
 
 
 class RelationType(str, Enum):
@@ -93,7 +135,7 @@ class RelationType(str, Enum):
 
     # 概念 → 概念（层级关系）
     BELONGS_TO = "belongs_to"
-    """属于更大的概念类别（如 OFDM belongs_to 多载波技术）"""
+    """属于更大的概念类别（如 ReAct belongs_to Agent Planning Methods）"""
 
     RELATED_TO = "related_to"
     """与某个概念相关（通用关系，无法归入上述类别时使用）"""
@@ -101,6 +143,97 @@ class RelationType(str, Enum):
     # 方法 → 数据集
     TESTED_ON = "tested_on"
     """在某个数据集上进行了测试"""
+
+    # ============================================================
+    # 扩展关系（2026-05-20，按"必要性而非粒度"原则增量补）
+    # ============================================================
+    ENABLES = "enables"
+    """A 使 B 成为可能（如 Tool Use enables Agent Planning）"""
+
+    REQUIRES = "requires"
+    """A 依赖 B 才能工作（如 ReAct requires Tool Use）"""
+
+    PRETRAINED_ON = "pretrained_on"
+    """模型/方法在某数据集上预训练（model → dataset，区别于 tested_on）"""
+
+    EVALUATED_AGAINST = "evaluated_against"
+    """与某 baseline 对比（区别于 compares_with：后者强调论文层面对比，前者强调方法层面）"""
+
+    SUPERSEDES = "supersedes"
+    """A 取代了 B（B 的 superseded_by 指向 A 的反向关系）"""
+
+
+# 旧关系类型别名（向后兼容）
+RELATION_TYPE_ALIASES: dict[str, RelationType] = {
+    "depends_on": RelationType.REQUIRES,
+    "supersede": RelationType.SUPERSEDES,
+    "compare_with": RelationType.COMPARES_WITH,
+    "tested_against": RelationType.EVALUATED_AGAINST,
+}
+
+
+# ============================================================
+# 领域标记 + 容错解析
+# ============================================================
+
+# KG 节点/边所属研究域。新增节点不指定时默认 "shared"。
+# - "llm_agent": LLM Agent / RAG / Memory / Tool Use / Reflection ...
+# - "comms":     5G/ISAC/SLAM/Localization/mmWave/RHS ...
+# - "shared":    跨域通用（如 Attention, Transformer, EM Algorithm）
+DOMAIN_LLM = "llm_agent"
+DOMAIN_COMMS = "comms"
+DOMAIN_SHARED = "shared"
+KNOWN_DOMAINS = (DOMAIN_LLM, DOMAIN_COMMS, DOMAIN_SHARED)
+
+
+def coerce_node_type(raw: str) -> tuple[NodeType, bool]:
+    """把字符串解析为 NodeType。返回 (类型, is_fallback)。
+
+    解析顺序：
+      1. 直接 NodeType(raw) 命中
+      2. NODE_TYPE_ALIASES 命中（领域专用→通用映射）
+      3. fallback 到 NodeType.OTHER（is_fallback=True，调用方应记 warning）
+    """
+    import logging
+    logger = logging.getLogger("ScholarMind.Schema")
+    if not raw:
+        return NodeType.OTHER, True
+    try:
+        return NodeType(raw), False
+    except ValueError:
+        pass
+    if raw in NODE_TYPE_ALIASES:
+        mapped = NODE_TYPE_ALIASES[raw]
+        logger.info("node_type alias resolved: %r -> %s", raw, mapped.value)
+        return mapped, False
+    logger.warning("node_type unknown, falling back to OTHER: %r", raw)
+    return NodeType.OTHER, True
+
+
+def coerce_relation_type(raw: str) -> tuple[RelationType, bool]:
+    """把字符串解析为 RelationType。返回 (类型, is_fallback)。"""
+    import logging
+    logger = logging.getLogger("ScholarMind.Schema")
+    if not raw:
+        return RelationType.RELATED_TO, True
+    try:
+        return RelationType(raw), False
+    except ValueError:
+        pass
+    if raw in RELATION_TYPE_ALIASES:
+        mapped = RELATION_TYPE_ALIASES[raw]
+        logger.info("relation_type alias resolved: %r -> %s", raw, mapped.value)
+        return mapped, False
+    logger.warning("relation_type unknown, falling back to related_to: %r", raw)
+    return RelationType.RELATED_TO, True
+
+
+def normalize_domain(raw: str | None) -> str:
+    """domain 标准化。未知 / None / 空 → DOMAIN_SHARED。"""
+    if not raw:
+        return DOMAIN_SHARED
+    raw = raw.strip().lower()
+    return raw if raw in KNOWN_DOMAINS else DOMAIN_SHARED
 
 
 # ============================================================
@@ -113,7 +246,7 @@ class KGNode:
 
     Attributes:
         node_id: 唯一标识符（自动从 label + node_type 生成）
-        label: 节点显示名称（如 "OFDM", "Hybrid Beamforming"）
+        label: 节点显示名称（如 "ReAct", "Memory Module"）
         node_type: 节点类型
         properties: 附加属性（如论文的 year, venue; 方法的 complexity）
         source_paper: 该节点来源的论文标题（用于溯源）
@@ -123,7 +256,7 @@ class KGNode:
 
     【工程思考】为什么 node_id 自动生成？
     保证不同论文中提到的相同概念映射到同一个节点 ID。
-    例如 Paper A 和 Paper B 都提到 "OFDM"，应该合并到同一个节点。
+    例如 Paper A 和 Paper B 都提到 "ReAct"，应该合并到同一个节点。
 
     【双时态 (Bi-temporal) 设计】
     借鉴 Zep/Graphiti 的时序知识图谱思想，每个节点/边携带两个时间轴：
@@ -141,6 +274,8 @@ class KGNode:
     first_seen_year: int | None = None
     superseded_by: str | None = None
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    domain: str = DOMAIN_SHARED
+    """研究域标记：llm_agent / comms / shared。默认 shared。"""
 
     @property
     def node_id(self) -> str:
@@ -148,7 +283,7 @@ class KGNode:
         根据 label 和 node_type 生成唯一 ID
 
         算法：type_normalized_label
-        例如：concept_ofdm, method_hybrid_beamforming, paper_xxxx(hash)
+        例如：concept_tool_use, method_react, paper_xxxx(hash)
         """
         normalized = self._normalize_label(self.label)
         if self.node_type == NodeType.PAPER:
@@ -164,7 +299,7 @@ class KGNode:
         """
         标签标准化：小写 + 去除特殊字符 + 空格转下划线
 
-        用于保证 "OFDM" == "ofdm" == "Ofdm" 映射到同一节点
+        用于保证 "ReAct" == "react" == "REACT" 映射到同一节点
         """
         label = label.lower().strip()
         # 只保留字母、数字、空格
@@ -179,7 +314,7 @@ class KGNode:
 
         【工程思考】为什么需要合并？
         同一个概念可能从不同论文中被抽取，每次抽取的属性可能不同。
-        例如从 Paper A 抽取了 OFDM 的定义，从 Paper B 抽取了 OFDM 的应用场景。
+        例如从 Paper A 抽取了 ReAct 的定义，从 Paper B 抽取了 ReAct 的应用场景。
         """
         for key, value in other_properties.items():
             if key not in self.properties:
@@ -204,6 +339,7 @@ class KGNode:
             "properties": self.properties,
             "source_paper": self.source_paper,
             "created_at": self.created_at,
+            "domain": self.domain,
         }
         # 有效时间字段：仅在有值时序列化（向后兼容已有 JSON）
         if self.first_seen_year is not None:
@@ -214,15 +350,17 @@ class KGNode:
 
     @classmethod
     def from_dict(cls, data: dict) -> "KGNode":
-        """从字典反序列化（兼容不含时间字段的旧数据）"""
+        """从字典反序列化（容错：未知 node_type 不抛 ValueError，落到 OTHER 并 warn）"""
+        node_type, _is_fallback = coerce_node_type(str(data.get("node_type", "")))
         return cls(
             label=data["label"],
-            node_type=NodeType(data["node_type"]),
+            node_type=node_type,
             properties=data.get("properties", {}),
             source_paper=data.get("source_paper", ""),
             first_seen_year=data.get("first_seen_year"),
             superseded_by=data.get("superseded_by"),
             created_at=data.get("created_at", datetime.now(timezone.utc).isoformat(timespec="seconds")),
+            domain=normalize_domain(data.get("domain")),
         )
 
 
@@ -250,6 +388,8 @@ class KGEdge:
     source_paper: str = ""
     established_year: int | None = None
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    domain: str = DOMAIN_SHARED
+    """关系所属研究域，默认 shared。跨域边可保留 shared 让两侧 KG 都看得到。"""
 
     @property
     def edge_id(self) -> str:
@@ -266,6 +406,7 @@ class KGEdge:
             "confidence": self.confidence,
             "source_paper": self.source_paper,
             "created_at": self.created_at,
+            "domain": self.domain,
         }
         if self.established_year is not None:
             d["established_year"] = self.established_year
@@ -273,16 +414,18 @@ class KGEdge:
 
     @classmethod
     def from_dict(cls, data: dict) -> "KGEdge":
-        """从字典反序列化（兼容不含时间字段的旧数据）"""
+        """从字典反序列化（容错：未知 relation_type 不抛错，落到 related_to 并 warn）"""
+        relation_type, _is_fallback = coerce_relation_type(str(data.get("relation_type", "")))
         return cls(
             source_id=data["source_id"],
             target_id=data["target_id"],
-            relation_type=RelationType(data["relation_type"]),
+            relation_type=relation_type,
             properties=data.get("properties", {}),
             confidence=data.get("confidence", 0.8),
             source_paper=data.get("source_paper", ""),
             established_year=data.get("established_year"),
             created_at=data.get("created_at", datetime.now(timezone.utc).isoformat(timespec="seconds")),
+            domain=normalize_domain(data.get("domain")),
         )
 
 
@@ -300,6 +443,10 @@ class ExtractionResult:
     raw_llm_output: str = ""
     paper_title: str = ""
     extraction_confidence: float = 0.0
+    had_parse_fallback: bool = False
+    """LLM 输出严格 Pydantic 解析失败、走宽松 fallback 时为 True。调用方据此知道质量降级。"""
+    parse_warnings: list[str] = field(default_factory=list)
+    """解析过程中遇到的非致命警告（如 alias 解析、未知字段忽略）。"""
 
     @property
     def node_count(self) -> int:
@@ -362,20 +509,20 @@ class ExtractedNode(BaseModel):
     与内部存储用的 KGNode dataclass 分离，各自演进互不影响。
     """
     label: str = Field(
-        description="实体名称，必须使用标准英文缩写（如 OFDM 而非 Orthogonal Frequency Division Multiplexing）"
+        description="实体名称，必须使用标准英文名称或缩写（如 ReAct、MemGPT、RAG、Toolformer）"
     )
     node_type: NodeTypeLiteral = Field(  # type: ignore[valid-type]
         description="节点类型，必须为以下之一: " + ", ".join(_NODE_TYPE_VALUES)
     )
-    properties: dict[str, str | int | float] = Field(
+    properties: Dict[str, Union[str, int, float]] = Field(
         default_factory=dict,
         description="节点属性（如 year, venue, definition, category 等）"
     )
-    first_seen_year: int | None = Field(
+    first_seen_year: Optional[int] = Field(
         default=None,
         description="该知识/方法首次出现的年份（如 2017）。从论文发表年份推断。"
     )
-    superseded_by: str | None = Field(
+    superseded_by: Optional[str] = Field(
         default=None,
         description="如果该方法已被更新方法取代，填写取代者名称（如 Flash Attention）。无则留空。"
     )
@@ -392,7 +539,7 @@ class ExtractedEdge(BaseModel):
     relation_type: RelationTypeLiteral = Field(  # type: ignore[valid-type]
         description="关系类型，必须为以下之一: " + ", ".join(_RELATION_TYPE_VALUES)
     )
-    established_year: int | None = Field(
+    established_year: Optional[int] = Field(
         default=None,
         description="该关系被确立的年份。通常与论文发表年份相同。"
     )
@@ -418,7 +565,7 @@ class ExtractionOutput(BaseModel):
 # Schema 描述（用于 Prompt 嵌入，提供人类可读的上下文）
 #
 # 【工程思考】SCHEMA_DESCRIPTION 仍然保留为自然语言描述，
-# 因为 Prompt 中的领域示例（如 "OFDM, MIMO"）能帮助 LLM
+# 因为 Prompt 中的领域示例（如 "ReAct, MemGPT"）能帮助 LLM
 # 更好地理解抽取目标。JSON 格式约束则交给 Pydantic + API。
 # ============================================================
 SCHEMA_DESCRIPTION = """
@@ -428,9 +575,9 @@ SCHEMA_DESCRIPTION = """
 - **paper**: 论文（属性: title, year, venue, doi, abstract）
 - **author**: 作者（属性: name, affiliation）
 - **concept**: 领域概念/术语（属性: name, definition, domain）
-  - 示例: OFDM, MIMO, RIS, ISAC, Beamforming, Channel Estimation
+  - 示例: Agent Planning, Tool Use, Long-term Memory, RAG, Reflection, Multi-Agent Collaboration
 - **method**: 方法/算法（属性: name, category, complexity, description）
-  - 示例: Hybrid Beamforming, MUSIC Algorithm, UKF-based Localization
+  - 示例: ReAct, Plan-and-Execute, Reflection, Toolformer
 - **dataset**: 数据集（属性: name, description, link）
 - **metric**: 评估指标（属性: name, formula, unit）
   - 示例: BER, RMSE, CRLB, Spectral Efficiency, Throughput
