@@ -137,7 +137,7 @@ def _llm_rca(
     """调 MiniMax 生成根因假设。失败返回 None，让上层 fallback 到规则表。
 
     用 OpenAI-compatible client（同 extractor.py 的路径）：MINIMAX_API_KEY +
-    MINIMAX_BASE_URL；模型用 MINIMAX_MODEL（默认 MiniMax-M2）。
+    MINIMAX_BASE_URL；模型用 MINIMAX_MODEL（默认 MiniMax-M3）。
     """
     api_key = os.getenv("MINIMAX_API_KEY")
     if not api_key:
@@ -174,7 +174,7 @@ def _llm_rca(
             base_url=os.getenv("MINIMAX_BASE_URL", "https://api.minimax.io/v1"),
         )
         resp = client.chat.completions.create(
-            model=os.getenv("MINIMAX_MODEL", "MiniMax-M2"),
+            model=os.getenv("MINIMAX_MODEL", "MiniMax-M3"),
             messages=[{"role": "user", "content": prompt}],
             max_tokens=600,
             temperature=0.2,

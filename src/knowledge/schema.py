@@ -486,7 +486,7 @@ class ExtractionResult:
 # 【工程思考】为什么用 Pydantic 而不是手写 JSON Example？
 #   1. 单一来源原则：Enum 类型只在 NodeType/RelationType 定义一次，
 #      Pydantic 的 Literal 直接引用 Enum 的 .value，不会不同步
-#   2. 自动生成 JSON Schema：MiniMax-Text-01 支持 response_format=json_schema，
+#   2. 自动生成 JSON Schema：MiniMax-M3 支持 response_format=json_schema，
 #      传入 ExtractionOutput.model_json_schema() 即可在 API 层面强制约束输出
 #   3. 类型安全解析：model_validate_json() 替代手动 try/except，
 #      解析失败会抛出明确的 ValidationError 而不是静默丢数据

@@ -215,7 +215,7 @@ class KnowledgeExtractor:
         """
         Args:
             model: LLM 模型名称（默认从环境变量 MINIMAX_MODEL 读取）
-            max_tokens: LLM 最大输出 token 数（reasoning 模型如 MiniMax-M2 思考块本身可消耗
+            max_tokens: LLM 最大输出 token 数（reasoning 模型如 MiniMax-M3 思考块本身可消耗
                 数千 token，留 16000 才能保证 JSON 输出不被截断）
             min_confidence: 最低置信度阈值（低于此值的实体/关系不入图）
             max_chunk_chars: 单次抽取的最大文本长度（超过则分段）。默认 4000：
@@ -237,7 +237,7 @@ class KnowledgeExtractor:
                        捕捉 "Chain of Thought Reasoning" / "Chain-of-Thought" 这类
                        字面差异较大但语义同一的实体。
         """
-        self.model = model or os.getenv("MINIMAX_MODEL", "MiniMax-M2")
+        self.model = model or os.getenv("MINIMAX_MODEL", "MiniMax-M3")
         self.max_tokens = max_tokens
         self.min_confidence = min_confidence
         self.max_chunk_chars = max_chunk_chars
@@ -373,7 +373,7 @@ class KnowledgeExtractor:
         """
         调用 MiniMax API (OpenAI 兼容)
 
-        用 response_format=json_schema 在 API 层面约束输出格式。MiniMax-M2 系列是
+        用 response_format=json_schema 在 API 层面约束输出格式。MiniMax-M3 系列是
         reasoning 模型，响应会被 <think>...</think> 块包裹，调用方需要靠 strip
         清理后再解析。截断的思考块（<think> 开但未闭）会抛 ResponseTruncatedError，
         交给上层 _extract_single 的异常处理（不静默吞）。

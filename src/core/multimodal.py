@@ -170,12 +170,12 @@ class FigureAnalyzer:
         enable_cache: bool = True,
     ):
         # Phase 3.2: 独立 vision 模型 env (MINIMAX_VISION_MODEL)
-        # 防止 MINIMAX_MODEL 切到 reasoning 模型时图表分析静默变瞎。
-        # 默认 MiniMax-Text-01（可换 abab6.5s-chat）。
+        # 防止 MINIMAX_MODEL 切到纯文本模型时图表分析静默变瞎。
+        # 默认 MiniMax-M3（支持 image/video 输入模态）。
         self.model = (
             model
             or os.getenv("MINIMAX_VISION_MODEL")
-            or "MiniMax-Text-01"
+            or "MiniMax-M3"
         )
         self.max_tokens = max_tokens
         # 延迟加载 API key，避免导入时就报错

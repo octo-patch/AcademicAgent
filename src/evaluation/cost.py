@@ -14,9 +14,8 @@ from dataclasses import dataclass
 # USD / 1K tokens —— 估算用途，非财务结算口径。
 # MiniMax 公开价格较低，外部检索 API（Semantic Scholar / arXiv）免费。
 PRICE_TABLE: dict[str, dict[str, float]] = {
-    "MiniMax-M2": {"input": 0.0003, "output": 0.0014},
-    "MiniMax-Text-01": {"input": 0.0002, "output": 0.0011},
-    "MiniMax-VL-01": {"input": 0.0002, "output": 0.0011},
+    "MiniMax-M3": {"input": 0.0006, "output": 0.0024},
+    "MiniMax-M2.7": {"input": 0.0003, "output": 0.0012},
     "_default": {"input": 0.0002, "output": 0.0011},
     "_free": {"input": 0.0, "output": 0.0},
 }

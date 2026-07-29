@@ -99,9 +99,9 @@ class ReportGenerator:
         model: str | None = None,
         max_tokens: int = 16000,
     ):
-        # max_tokens=16000: reasoning 模型 (MiniMax-M2 等) 的 <think> 块本身可能消耗
+        # max_tokens=16000: reasoning 模型 (MiniMax-M3 等) 的 <think> 块本身可能消耗
         # 数千 token，必须留足空间给后续 JSON 输出
-        self.model = model or os.getenv("MINIMAX_MODEL", "MiniMax-M2")
+        self.model = model or os.getenv("MINIMAX_MODEL", "MiniMax-M3")
         self.max_tokens = max_tokens
         self._client = None
 
