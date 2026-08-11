@@ -34,7 +34,7 @@ import json
 import logging
 import os
 import sys
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -49,9 +49,17 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+from src.core.minimax_models import (  # noqa: E402
+    DEFAULT_MINIMAX_MODEL,
+    DEFAULT_MINIMAX_OPENAI_BASE_URL,
+)
 from src.knowledge.schema import (  # noqa: E402
-    KGNode, KGEdge, NodeType,
-    DOMAIN_LLM, DOMAIN_COMMS, DOMAIN_SHARED,
+    DOMAIN_COMMS,
+    DOMAIN_LLM,
+    DOMAIN_SHARED,
+    KGEdge,
+    KGNode,
+    NodeType,
 )
 from src.recorder import RefactorRecorder  # noqa: E402
 
@@ -119,7 +127,7 @@ class NodeClassification:
 
 class Classifier:
     def __init__(self, model: Optional[str] = None, batch_size: int = 20):
-        self.model = model or os.getenv("MINIMAX_MODEL", "MiniMax-M2")
+        self.model = model or os.getenv("MINIMAX_MODEL", DEFAULT_MINIMAX_MODEL)
         self.batch_size = batch_size
         self._client: Optional[OpenAI] = None
 
@@ -127,7 +135,9 @@ class Classifier:
     def client(self) -> OpenAI:
         if self._client is None:
             api_key = os.getenv("MINIMAX_API_KEY")
-            base_url = os.getenv("MINIMAX_BASE_URL", "https://api.minimax.io/v1")
+            base_url = os.getenv(
+                "MINIMAX_BASE_URL", DEFAULT_MINIMAX_OPENAI_BASE_URL
+            )
             if not api_key:
                 raise ValueError("MINIMAX_API_KEY 未设置")
             self._client = OpenAI(api_key=api_key, base_url=base_url)

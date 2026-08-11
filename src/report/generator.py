@@ -49,9 +49,18 @@ PROJECT_ROOT = Path(__file__).parent.parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.report.schema import PaperReport, ReportMeta, ReportSummary, REPORT_SCHEMA_DESCRIPTION
 from src.core.llm_response import strip_reasoning_artifacts
-
+from src.core.minimax_models import (
+    DEFAULT_MINIMAX_MODEL,
+    DEFAULT_MINIMAX_OPENAI_BASE_URL,
+    get_minimax_model_metadata,
+)
+from src.report.schema import (
+    REPORT_SCHEMA_DESCRIPTION,
+    PaperReport,
+    ReportMeta,
+    ReportSummary,
+)
 
 # ============================================================
 # 报告生成 Prompt
@@ -101,7 +110,8 @@ class ReportGenerator:
     ):
         # max_tokens=16000: reasoning 模型 (MiniMax-M3 等) 的 <think> 块本身可能消耗
         # 数千 token，必须留足空间给后续 JSON 输出
-        self.model = model or os.getenv("MINIMAX_MODEL", "MiniMax-M3")
+        self.model = model or os.getenv("MINIMAX_MODEL", DEFAULT_MINIMAX_MODEL)
+        self.model_metadata = get_minimax_model_metadata(self.model)
         self.max_tokens = max_tokens
         self._client = None
 
@@ -111,7 +121,9 @@ class ReportGenerator:
         if self._client is None:
             from openai import OpenAI
             api_key = os.getenv("MINIMAX_API_KEY")
-            base_url = os.getenv("MINIMAX_BASE_URL", "https://api.minimax.io/v1")
+            base_url = os.getenv(
+                "MINIMAX_BASE_URL", DEFAULT_MINIMAX_OPENAI_BASE_URL
+            )
             if not api_key:
                 raise ValueError("MINIMAX_API_KEY 未设置。请在 .env 中配置。")
             self._client = OpenAI(api_key=api_key, base_url=base_url)

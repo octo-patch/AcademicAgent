@@ -11,14 +11,21 @@ response 填 tokens_in/out（method="api_usage"）；拿不到时由 adapter 用
 
 from dataclasses import dataclass
 
+from src.core.minimax_models import MINIMAX_MODELS
+
 # USD / 1K tokens —— 估算用途，非财务结算口径。
 # MiniMax 公开价格较低，外部检索 API（Semantic Scholar / arXiv）免费。
 PRICE_TABLE: dict[str, dict[str, float]] = {
-    "MiniMax-M3": {"input": 0.0006, "output": 0.0024},
-    "MiniMax-M2.7": {"input": 0.0003, "output": 0.0012},
+    model_id: {
+        "input": metadata.pricing_usd_per_million_tokens["input"] / 1000,
+        "output": metadata.pricing_usd_per_million_tokens["output"] / 1000,
+    }
+    for model_id, metadata in MINIMAX_MODELS.items()
+}
+PRICE_TABLE.update({
     "_default": {"input": 0.0002, "output": 0.0011},
     "_free": {"input": 0.0, "output": 0.0},
-}
+})
 
 
 @dataclass

@@ -19,9 +19,9 @@ import pytest
 openai = pytest.importorskip("openai", reason="openai SDK not installed")
 
 from src.core.multimodal import (
-    FigureType,
     FigureAnalysisResult,
     FigureAnalyzer,
+    FigureType,
     PaperStructureParser,
 )
 
@@ -238,17 +238,17 @@ class TestPhase3VisionConfig:
 
     def test_vision_uses_separate_env(self, monkeypatch):
         from src.core.multimodal import FigureAnalyzer
-        monkeypatch.setenv("MINIMAX_VISION_MODEL", "MiniMax-M2.7")
-        monkeypatch.setenv("MINIMAX_MODEL", "MiniMax-M3")
+        monkeypatch.setenv("MINIMAX_VISION_MODEL", "MiniMax-M3")
+        monkeypatch.setenv("MINIMAX_MODEL", "MiniMax-M2.7")
         fa = FigureAnalyzer()
-        assert fa.model == "MiniMax-M2.7",             "vision should use MINIMAX_VISION_MODEL not MINIMAX_MODEL"
+        assert fa.model == "MiniMax-M3",               "vision should use MINIMAX_VISION_MODEL not MINIMAX_MODEL"
 
     def test_vision_falls_back_to_default(self, monkeypatch):
         from src.core.multimodal import FigureAnalyzer
         monkeypatch.delenv("MINIMAX_VISION_MODEL", raising=False)
         monkeypatch.setenv("MINIMAX_MODEL", "MiniMax-M2.7")
         fa = FigureAnalyzer()
-        # 没有 vision env 时回到默认（不再误用 MINIMAX_MODEL）
+        # The vision default must not inherit a text-only MINIMAX_MODEL.
         assert fa.model == "MiniMax-M3"
 
     def test_cache_toggle(self):

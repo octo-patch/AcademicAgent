@@ -30,21 +30,27 @@ import os
 import re
 from dataclasses import dataclass
 
-from openai import OpenAI
 from dotenv import load_dotenv
+from openai import OpenAI
 
+from src.core.llm_response import strip_reasoning_artifacts
+from src.core.minimax_models import (
+    DEFAULT_MINIMAX_MODEL,
+    DEFAULT_MINIMAX_OPENAI_BASE_URL,
+    get_minimax_model_metadata,
+)
+
+from .entity_linker import AliasMap, EntityLinker
 from .schema import (
-    KGNode,
-    KGEdge,
-    ExtractionResult,
-    ExtractionOutput,
     SCHEMA_DESCRIPTION,
     SCHEMA_JSON_EXAMPLE,
+    ExtractionOutput,
+    ExtractionResult,
+    KGEdge,
+    KGNode,
     coerce_node_type,
     coerce_relation_type,
 )
-from .entity_linker import AliasMap, EntityLinker
-from src.core.llm_response import strip_reasoning_artifacts
 
 
 class ExtractionError(Exception):
@@ -237,7 +243,8 @@ class KnowledgeExtractor:
                        捕捉 "Chain of Thought Reasoning" / "Chain-of-Thought" 这类
                        字面差异较大但语义同一的实体。
         """
-        self.model = model or os.getenv("MINIMAX_MODEL", "MiniMax-M3")
+        self.model = model or os.getenv("MINIMAX_MODEL", DEFAULT_MINIMAX_MODEL)
+        self.model_metadata = get_minimax_model_metadata(self.model)
         self.max_tokens = max_tokens
         self.min_confidence = min_confidence
         self.max_chunk_chars = max_chunk_chars
@@ -257,7 +264,9 @@ class KnowledgeExtractor:
         """懒加载 OpenAI-compatible client (MiniMax)"""
         if self._client is None:
             api_key = os.getenv("MINIMAX_API_KEY")
-            base_url = os.getenv("MINIMAX_BASE_URL", "https://api.minimax.io/v1")
+            base_url = os.getenv(
+                "MINIMAX_BASE_URL", DEFAULT_MINIMAX_OPENAI_BASE_URL
+            )
             if not api_key:
                 raise ValueError(
                     "MINIMAX_API_KEY 未设置。请在 .env 中配置。"

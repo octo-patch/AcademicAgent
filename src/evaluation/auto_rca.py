@@ -25,6 +25,11 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
+from src.core.minimax_models import (
+    DEFAULT_MINIMAX_MODEL,
+    DEFAULT_MINIMAX_OPENAI_BASE_URL,
+)
+
 logger = logging.getLogger("AcademicAgent.Eval.AutoRCA")
 
 
@@ -171,10 +176,12 @@ def _llm_rca(
         from openai import OpenAI
         client = OpenAI(
             api_key=api_key,
-            base_url=os.getenv("MINIMAX_BASE_URL", "https://api.minimax.io/v1"),
+            base_url=os.getenv(
+                "MINIMAX_BASE_URL", DEFAULT_MINIMAX_OPENAI_BASE_URL
+            ),
         )
         resp = client.chat.completions.create(
-            model=os.getenv("MINIMAX_MODEL", "MiniMax-M3"),
+            model=os.getenv("MINIMAX_MODEL", DEFAULT_MINIMAX_MODEL),
             messages=[{"role": "user", "content": prompt}],
             max_tokens=600,
             temperature=0.2,

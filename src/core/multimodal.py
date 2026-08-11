@@ -37,8 +37,14 @@ from enum import Enum
 from pathlib import Path
 from string import Template
 
-from openai import OpenAI
 from dotenv import load_dotenv
+from openai import OpenAI
+
+from src.core.minimax_models import (
+    DEFAULT_MINIMAX_OPENAI_BASE_URL,
+    DEFAULT_MINIMAX_VISION_MODEL,
+    get_minimax_model_metadata,
+)
 
 # 加载环境变量
 load_dotenv()
@@ -175,8 +181,9 @@ class FigureAnalyzer:
         self.model = (
             model
             or os.getenv("MINIMAX_VISION_MODEL")
-            or "MiniMax-M3"
+            or DEFAULT_MINIMAX_VISION_MODEL
         )
+        self.model_metadata = get_minimax_model_metadata(self.model)
         self.max_tokens = max_tokens
         # 延迟加载 API key，避免导入时就报错
         self._client = None
@@ -188,7 +195,9 @@ class FigureAnalyzer:
         """懒加载 OpenAI-compatible client (MiniMax)"""
         if self._client is None:
             api_key = os.getenv("MINIMAX_API_KEY")
-            base_url = os.getenv("MINIMAX_BASE_URL", "https://api.minimax.io/v1")
+            base_url = os.getenv(
+                "MINIMAX_BASE_URL", DEFAULT_MINIMAX_OPENAI_BASE_URL
+            )
             if not api_key:
                 raise ValueError(
                     "MINIMAX_API_KEY 未设置。请在 .env 中配置。"

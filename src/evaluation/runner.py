@@ -19,12 +19,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from src.core.minimax_models import DEFAULT_MINIMAX_MODEL
+
 from .aggregate import aggregate_run, compute_task_metrics
 from .dataset import Dataset, DatasetError, load_dataset
 from .isolation import detect_contamination, snapshot_protected
 from .layers.layer1_component import run_layer1
 from .layers.layer3_e2e import run_layer3
-from .schema import EvalLayer, RunConfig, Tier, TaskResult
+from .schema import EvalLayer, RunConfig, TaskResult, Tier
 from .tracer import Tracer
 
 logger = logging.getLogger("AcademicAgent.Eval.Runner")
@@ -69,7 +71,7 @@ def _env_snapshot() -> dict[str, str]:
     return {
         "python": sys.version.split()[0],
         "platform": platform.platform(),
-        "minimax_model": os.getenv("MINIMAX_MODEL", "MiniMax-M2"),
+        "minimax_model": os.getenv("MINIMAX_MODEL", DEFAULT_MINIMAX_MODEL),
         "has_minimax_key": str(bool(os.getenv("MINIMAX_API_KEY"))),
     }
 
@@ -97,7 +99,7 @@ class EvalRunner:
         self.enable_e2e = enable_e2e
         self.notion = notion
         self.task_ids = set(task_ids) if task_ids else None
-        self.model = model or os.getenv("MINIMAX_MODEL", "MiniMax-M2")
+        self.model = model or os.getenv("MINIMAX_MODEL", DEFAULT_MINIMAX_MODEL)
         self.run_id = run_id or self._default_run_id()
         # 绝对路径：CodeSandbox 等下游对相对路径 + cwd 组合敏感，统一用绝对路径
         self.run_dir = (Path(out_dir) / self.run_id).resolve()
