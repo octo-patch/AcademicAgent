@@ -142,7 +142,7 @@ def _llm_rca(
     """调 MiniMax 生成根因假设。失败返回 None，让上层 fallback 到规则表。
 
     用 OpenAI-compatible client（同 extractor.py 的路径）：MINIMAX_API_KEY +
-    MINIMAX_BASE_URL；模型用 MINIMAX_MODEL（默认 MiniMax-M3）。
+    MINIMAX_BASE_URL; MINIMAX_MODEL defaults to MiniMax-M3.1-Flash.
     """
     api_key = os.getenv("MINIMAX_API_KEY")
     if not api_key:
